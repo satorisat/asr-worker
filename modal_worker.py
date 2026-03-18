@@ -69,6 +69,7 @@ class ASRWorker:
         import os
         import torch
         import whisperx
+        from pyannote.audio import Pipeline
 
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -93,7 +94,10 @@ class ASRWorker:
         if hf_token:
             try:
                 os.environ["HF_HUB_OFFLINE"] = "0"
-                self.diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=self.device)
+                self.diarize_model = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=hf_token,
+                ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
             except Exception as e:
@@ -201,14 +205,16 @@ class ASRWorker:
 
         if enable_diarization and self.diarize_model:
             try:
+                import torch
                 kwargs = {}
                 if min_speakers > 1:
                     kwargs["min_speakers"] = min_speakers
                 if max_speakers > 1:
                     kwargs["max_speakers"] = max_speakers
-                diarize_segments = self.diarize_model(audio_path, **kwargs)
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-                segments = result.get("segments", [])
+                import torchaudio
+                waveform, sample_rate = torchaudio.load(audio_path)
+                diarize_result = self.diarize_model({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
+                segments = self._assign_speakers(segments, diarize_result)
             except Exception as e:
                 print(f"Diarization failed: {e}")
 
@@ -229,12 +235,14 @@ class ASRWorker:
 
         if enable_diarization and self.diarize_model and segments:
             try:
+                import torchaudio
                 kwargs = {}
                 if min_speakers > 1:
                     kwargs["min_speakers"] = min_speakers
                 if max_speakers > 1:
                     kwargs["max_speakers"] = max_speakers
-                diarize_result = self.diarize_model(audio_path, **kwargs)
+                waveform, sample_rate = torchaudio.load(audio_path)
+                diarize_result = self.diarize_model({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
                 segments = self._assign_speakers(segments, diarize_result)
             except Exception as e:
                 print(f"Diarization failed: {e}")
