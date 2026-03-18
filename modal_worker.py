@@ -60,7 +60,7 @@ image = (
     gpu="L4",
     image=image,
     secrets=[modal.Secret.from_name("hf-token")],
-    scaledown_window=300,
+    scaledown_window=10,
 )
 class ASRWorker:
 
