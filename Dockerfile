@@ -19,13 +19,7 @@ RUN pip install --no-cache-dir \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download all models from HuggingFace into the image
-# HF_TOKEN needed for pyannote (accept terms at hf.co first:
-#   pyannote/speaker-diarization-3.1
-#   pyannote/segmentation-3.0)
-ARG HF_TOKEN
-ENV HF_TOKEN=${HF_TOKEN}
-
+# Pre-download whisperx and gigaam models (no auth needed)
 RUN python -c "\
 import whisperx; \
 whisperx.load_model('tiny', 'cpu', compute_type='float32'); \
@@ -37,10 +31,8 @@ import gigaam; \
 gigaam.load_model('v3_e2e_rnnt'); \
 "
 
-RUN if [ -n "$HF_TOKEN" ]; then python -c "\
-from pyannote.audio import Pipeline; \
-Pipeline.from_pretrained('pyannote/speaker-diarization-3.1', use_auth_token='$HF_TOKEN'); \
-"; fi
+# Note: pyannote/speaker-diarization-3.1 requires HF_TOKEN and is downloaded
+# on first cold start using the HF_TOKEN env var set in RunPod endpoint settings.
 
 # Copy worker code
 COPY handler.py .
