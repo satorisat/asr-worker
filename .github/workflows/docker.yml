@@ -24,3 +24,5 @@ jobs:
           context: .
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/asr-worker:latest
+          build-args: |
+            HF_TOKEN=${{ secrets.HF_TOKEN }}
