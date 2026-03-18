@@ -57,7 +57,7 @@ image = (
 # ---------------------------------------------------------------------------
 
 @app.cls(
-    gpu="A10G",
+    gpu="L4",
     image=image,
     secrets=[modal.Secret.from_name("hf-token")],
     scaledown_window=300,
