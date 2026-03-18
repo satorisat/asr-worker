@@ -43,6 +43,7 @@ image = (
     .pip_install(
         "requests",
         "huggingface_hub",
+        "fastapi[standard]",
         "git+https://github.com/m-bain/whisperX.git",
         "git+https://github.com/salute-developers/GigaAM.git",
         "pyannote.audio",
