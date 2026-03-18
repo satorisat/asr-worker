@@ -1,9 +1,39 @@
 """
 RunPod Serverless Worker — Audio Transcription
 Dual-model: GigaAM v3 (Russian) + WhisperX large-v3 (all other languages)
+
+Requirements:
+  - HF_TOKEN env var — needed for pyannote diarization and GigaAM longform VAD
+    Get token at huggingface.co, accept terms for:
+    pyannote/speaker-diarization-3.1
+    pyannote/segmentation-3.0
+
+Input:
+  {
+    "audio_url": "https://...",       # presigned URL to audio file
+    "language": "auto",               # "auto", "russian", "english", etc.
+    "enable_diarization": true,
+    "min_speakers": 1,
+    "max_speakers": 4
+  }
+
+Output (LemonFox-compatible format):
+  {
+    "text": "full transcript",
+    "formatted_text": "**Speaker A:** ...\n\n**Speaker B:** ...",
+    "segments": [{"start": 0.0, "end": 2.5, "text": "...", "speaker": "SPEAKER_00"}],
+    "language": "russian",
+    "duration": 123.45,
+    "word_count": 150
+  }
 """
 
 import os
+
+# Force offline mode — use only models baked into the Docker image
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import json
 import tempfile
 import subprocess
@@ -17,6 +47,10 @@ import whisperx
 device = "cuda" if torch.cuda.is_available() else "cpu"
 compute_type = "float16" if device == "cuda" else "float32"
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
+# ---------------------------------------------------------------------------
+# Load all models once at worker startup (cached in memory between requests)
+# ---------------------------------------------------------------------------
 
 print(f"Device: {device}, compute_type: {compute_type}")
 
@@ -44,7 +78,13 @@ else:
 print("All models loaded. Worker ready.")
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def download_audio(url: str) -> str:
+    """Download audio file to a temp path, return the path."""
+    # Determine extension from URL (ignore query params)
     clean_url = url.split("?")[0]
     ext = clean_url.rsplit(".", 1)[-1].lower()
     if ext not in ("mp3", "wav", "ogg", "flac", "m4a", "mp4", "aac", "opus"):
@@ -63,6 +103,7 @@ def download_audio(url: str) -> str:
 
 
 def get_duration(audio_path: str) -> float:
+    """Get audio duration in seconds via ffprobe."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", audio_path],
@@ -75,8 +116,9 @@ def get_duration(audio_path: str) -> float:
 
 
 def detect_language(audio_path: str) -> str:
+    """Detect language from first 30s using Whisper tiny."""
     audio = whisperx.load_audio(audio_path)
-    audio_30s = audio[:30 * 16000]
+    audio_30s = audio[:30 * 16000]  # 16kHz
     result = tiny_model.transcribe(audio_30s)
     return result.get("language", "en")
 
@@ -94,6 +136,7 @@ def format_speaker_name(speaker_id: str) -> str:
 
 
 def build_formatted_text(segments: list) -> str:
+    """Build **Speaker A:** ... formatted text from segments."""
     lines = []
     current_speaker = None
     current_texts = []
@@ -118,6 +161,7 @@ def build_formatted_text(segments: list) -> str:
 
 
 def assign_speakers_to_segments(segments: list, diarize_result) -> list:
+    """Assign pyannote speaker labels to segments by max overlap."""
     speaker_turns = []
     try:
         for turn, _, speaker in diarize_result.itertracks(yield_label=True):
@@ -141,6 +185,10 @@ def assign_speakers_to_segments(segments: list, diarize_result) -> list:
     return segments
 
 
+# ---------------------------------------------------------------------------
+# Transcription functions
+# ---------------------------------------------------------------------------
+
 def run_whisperx(audio_path: str, language: str, enable_diarization: bool,
                  min_speakers: int, max_speakers: int) -> tuple[list, str]:
     lang = None if language == "auto" else language
@@ -148,6 +196,7 @@ def run_whisperx(audio_path: str, language: str, enable_diarization: bool,
     result = whisperx_model.transcribe(audio_path, language=lang, batch_size=16)
     detected_lang = result.get("language", "en")
 
+    # Word-level alignment (improves timestamp accuracy)
     try:
         model_a, metadata = whisperx.load_align_model(language_code=detected_lang, device=device)
         result = whisperx.align(
@@ -159,6 +208,7 @@ def run_whisperx(audio_path: str, language: str, enable_diarization: bool,
 
     segments = result.get("segments", [])
 
+    # Speaker diarization
     if enable_diarization and diarize_model:
         try:
             kwargs = {}
@@ -187,6 +237,7 @@ def run_whisperx(audio_path: str, language: str, enable_diarization: bool,
 
 def run_gigaam(audio_path: str, enable_diarization: bool,
                min_speakers: int, max_speakers: int) -> tuple[list, str]:
+    # transcribe_longform splits audio via VAD and transcribes each chunk
     raw = gigaam_model.transcribe_longform(audio_path)
 
     segments = []
@@ -196,6 +247,7 @@ def run_gigaam(audio_path: str, enable_diarization: bool,
         if text:
             segments.append({"start": float(start), "end": float(end), "text": text})
 
+    # Speaker diarization
     if enable_diarization and diarize_model and segments:
         try:
             kwargs = {}
@@ -213,6 +265,10 @@ def run_gigaam(audio_path: str, enable_diarization: bool,
 
     return segments, "russian"
 
+
+# ---------------------------------------------------------------------------
+# Main handler
+# ---------------------------------------------------------------------------
 
 def handler(job):
     job_input = job.get("input", {})
@@ -233,11 +289,13 @@ def handler(job):
         duration = get_duration(audio_path)
         print(f"Duration: {duration:.1f}s")
 
+        # Language detection
         if language == "auto":
             print("Detecting language...")
             language = detect_language(audio_path)
             print(f"Detected: {language}")
 
+        # Route to correct model
         if language in ("russian", "ru"):
             print("Using GigaAM (Russian)")
             segments, lang = run_gigaam(audio_path, enable_diarization, min_speakers, max_speakers)
