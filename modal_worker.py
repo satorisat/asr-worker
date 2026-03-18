@@ -100,7 +100,7 @@ class ASRWorker:
 
         print("All models loaded. Worker ready.")
 
-    @modal.web_endpoint(method="POST")
+    @modal.fastapi_endpoint(method="POST")
     def transcribe(self, request: dict) -> dict:
         audio_url = request.get("audio_url")
         language = request.get("language", "auto")
