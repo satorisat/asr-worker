@@ -77,6 +77,7 @@ image = (
     image=image,
     secrets=[modal.Secret.from_name("hf-token")],
     scaledown_window=10,
+    timeout=3600,  # 1 hour — for long audio files
 )
 class ASRWorker:
 
