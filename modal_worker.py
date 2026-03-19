@@ -252,6 +252,18 @@ class ASRWorker:
                     best_overlap = overlap
                     best_speaker = turn["speaker"]
             seg["speaker"] = best_speaker
+
+        # Renumber speakers by order of first appearance: SPEAKER_04 → SPEAKER_00, etc.
+        speaker_order = {}
+        for seg in segments:
+            sp = seg.get("speaker")
+            if sp and sp not in speaker_order:
+                speaker_order[sp] = len(speaker_order)
+        for seg in segments:
+            sp = seg.get("speaker")
+            if sp in speaker_order:
+                seg["speaker"] = f"SPEAKER_{speaker_order[sp]:02d}"
+
         return segments
 
     def _build_formatted_text(self, segments):
@@ -275,9 +287,7 @@ class ASRWorker:
         if speaker_id.startswith("SPEAKER_"):
             try:
                 idx = int(speaker_id.replace("SPEAKER_", ""))
-                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                if idx < len(letters):
-                    return f"Speaker {letters[idx]}"
+                return f"Спикер {idx + 1}"
             except ValueError:
                 pass
         return speaker_id
