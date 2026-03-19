@@ -92,6 +92,9 @@ class ASRWorker:
         if not hasattr(np, 'NaN'):
             np.NaN = np.nan
 
+        # Patch PyTorch 2.6: weights_only=True by default breaks pyannote checkpoints
+        torch.serialization.add_safe_globals([torch.torch_version.TorchVersion])
+
         from pyannote.audio import Pipeline
         from silero_vad import load_silero_vad
         import gigaam
