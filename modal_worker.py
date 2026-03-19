@@ -43,13 +43,17 @@ def download_models():
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
+    # torch первым — чтобы torchcodec (dep pyannote 3.3) нашёл правильные CUDA-колёса
+    .pip_install(
+        "torch",
+        "torchaudio",
+        extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
     .pip_install(
         "requests",
         "huggingface_hub>=0.20.0",
         "fastapi[standard]",
-        "numpy<2.0",
-        # <3.3 чтобы не тянуть torchcodec
-        "pyannote.audio>=3.1.0,<3.3",
+        "pyannote.audio>=3.1.0",
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
