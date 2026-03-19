@@ -58,7 +58,6 @@ image = (
         "fastapi[standard]",
         "git+https://github.com/m-bain/whisperX.git",
         "git+https://github.com/salute-developers/GigaAM.git",
-        "pyannote.audio==3.1.1",  # pin to avoid torchcodec dependency (broken in this env)
     )
     .run_function(download_models, cpu=2.0)
 )
