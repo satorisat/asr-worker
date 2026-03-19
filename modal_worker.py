@@ -47,6 +47,7 @@ image = (
         "requests",
         "huggingface_hub>=0.20.0",
         "fastapi[standard]",
+        "numpy<2.0",
         # <3.3 чтобы не тянуть torchcodec
         "pyannote.audio>=3.1.0,<3.3",
         "speechbrain>=1.0.0",
