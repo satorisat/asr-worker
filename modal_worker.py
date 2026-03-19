@@ -82,6 +82,17 @@ class ASRWorker:
 
         print(f"Device: {self.device}")
 
+        # Patch GigaAM vad_utils: passes local snapshot path to Model.from_pretrained()
+        # but pyannote 3.3.2 expects a HF repo ID. Override to pass repo ID directly.
+        import gigaam.vad_utils as _vad
+        def _patched_load_segmentation_model(model_id):
+            from pyannote.audio import Model
+            from torch.torch_version import TorchVersion
+            from pyannote.audio.core.task import Problem, Resolution, Specifications
+            with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
+                return Model.from_pretrained(model_id, use_auth_token=os.environ.get("HF_TOKEN"))
+        _vad.load_segmentation_model = _patched_load_segmentation_model
+
         print("Loading GigaAM v3...")
         self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
         if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
