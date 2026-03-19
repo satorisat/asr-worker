@@ -48,16 +48,12 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
     .pip_install(
-        "torchcodec>=0.6.0",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .pip_install(
         "requests",
         "huggingface_hub>=0.20.0",
         "fastapi[standard]",
         "silero-vad",
-        # миррор DialogScribe (yaruslove/DialogScribe) — рабочая сборка GigaAM + pyannote
-        "pyannote.audio>=3.1.0",
+        # <3.3 чтобы не тянуть torchcodec (как у DialogScribe)
+        "pyannote.audio>=3.1.0,<3.3",
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
