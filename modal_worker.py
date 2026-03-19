@@ -39,6 +39,7 @@ image = (
         "requests",
         "huggingface_hub>=0.20.0",
         "fastapi[standard]",
+        "soundfile",
         "pyannote.audio>=3.1.0",
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
@@ -63,7 +64,15 @@ class ASRWorker:
 
     @modal.enter()
     def load_models(self):
+        import sys
         import torch
+
+        # Block torchcodec before pyannote imports it — newer torchcodec moved
+        # AudioDecoder out of torchcodec.decoders, causing NameError at runtime.
+        # With torchcodec blocked, pyannote falls back to soundfile cleanly.
+        sys.modules["torchcodec"] = None
+        sys.modules["torchcodec.decoders"] = None
+
         from pyannote.audio import Pipeline
         import gigaam
 
