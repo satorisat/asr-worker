@@ -4,6 +4,7 @@ Dual-model: GigaAM v3 (Russian) + WhisperX large-v3 (all other languages)
 """
 
 import json
+import os
 import tempfile
 import subprocess
 import traceback
@@ -216,14 +217,21 @@ class ASRWorker:
 
         if enable_diarization and self.diarize_model:
             try:
-                import torchaudio
                 kwargs = {}
                 if min_speakers > 1:
                     kwargs["min_speakers"] = min_speakers
                 if max_speakers > 1:
                     kwargs["max_speakers"] = max_speakers
-                waveform, sample_rate = torchaudio.load(audio_path)
-                diarize_result = self.diarize_model({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
+                # Convert to wav for pyannote (torchaudio has issues with m4a/mp4)
+                wav_path = audio_path + ".wav"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
+                    capture_output=True,
+                )
+                diarize_input = wav_path if os.path.exists(wav_path) else audio_path
+                diarize_result = self.diarize_model(diarize_input, **kwargs)
+                if os.path.exists(wav_path):
+                    os.unlink(wav_path)
                 segments = self._assign_speakers(segments, diarize_result)
             except Exception as e:
                 print(f"Diarization failed: {e}")
@@ -245,14 +253,21 @@ class ASRWorker:
 
         if enable_diarization and self.diarize_model and segments:
             try:
-                import torchaudio
                 kwargs = {}
                 if min_speakers > 1:
                     kwargs["min_speakers"] = min_speakers
                 if max_speakers > 1:
                     kwargs["max_speakers"] = max_speakers
-                waveform, sample_rate = torchaudio.load(audio_path)
-                diarize_result = self.diarize_model({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
+                # Convert to wav for pyannote (torchaudio has issues with m4a/mp4)
+                wav_path = audio_path + ".wav"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
+                    capture_output=True,
+                )
+                diarize_input = wav_path if os.path.exists(wav_path) else audio_path
+                diarize_result = self.diarize_model(diarize_input, **kwargs)
+                if os.path.exists(wav_path):
+                    os.unlink(wav_path)
                 segments = self._assign_speakers(segments, diarize_result)
             except Exception as e:
                 print(f"Diarization failed: {e}")
