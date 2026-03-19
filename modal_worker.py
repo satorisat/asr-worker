@@ -48,6 +48,12 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
     .pip_install(
+        # torch 2.6 changed weights_only=True by default in torch.load, breaking pyannote checkpoints
+        "torch==2.5.1",
+        "torchaudio==2.5.1",
+        extra_index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
         "requests",
         # huggingface_hub>=1.0 removed use_auth_token kwarg which pyannote 3.1.x uses internally
         "huggingface_hub<1.0",
@@ -92,13 +98,6 @@ class ASRWorker:
         if not hasattr(np, 'NaN'):
             np.NaN = np.nan
 
-        # Patch PyTorch 2.6: weights_only=True by default breaks pyannote checkpoints.
-        # Monkey-patch torch.load to always use weights_only=False (pyannote models are trusted).
-        _original_torch_load = torch.load
-        def _patched_torch_load(*args, **kwargs):
-            kwargs.setdefault('weights_only', False)
-            return _original_torch_load(*args, **kwargs)
-        torch.load = _patched_torch_load
 
         from pyannote.audio import Pipeline
         from silero_vad import load_silero_vad
