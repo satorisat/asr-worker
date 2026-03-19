@@ -40,6 +40,9 @@ image = (
         "huggingface_hub>=0.20.0",
         "fastapi[standard]",
         "soundfile",
+        "matplotlib",
+        "scipy",
+        "sentencepiece",
         "pyannote.audio==3.3.2",  # 3.3.2 = последний 3.x: numpy 2.x safe, без torchcodec
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
@@ -92,7 +95,7 @@ class ASRWorker:
                 os.environ["HF_HUB_OFFLINE"] = "0"
                 self.diarize_model = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
-                    token=hf_token,
+                    use_auth_token=hf_token,
                 ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
