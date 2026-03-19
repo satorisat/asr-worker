@@ -21,7 +21,6 @@ app = modal.App("asr-worker")
 def download_models():
     from huggingface_hub import snapshot_download
     import gigaam
-    import torch
 
     print("Downloading faster-whisper-tiny...")
     snapshot_download("Systran/faster-whisper-tiny")
@@ -31,6 +30,11 @@ def download_models():
 
     print("Downloading GigaAM v3...")
     gigaam.load_model("v3_e2e_rnnt")
+
+    # Pre-download silero-vad (used instead of pyannote VAD for GigaAM longform)
+    print("Downloading silero-vad...")
+    from silero_vad import load_silero_vad
+    load_silero_vad()
 
     # Pre-download alignment models for common languages
     import whisperx
@@ -56,6 +60,7 @@ image = (
         "requests",
         "huggingface_hub",
         "fastapi[standard]",
+        "silero-vad",
         "git+https://github.com/m-bain/whisperX.git",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
@@ -100,6 +105,11 @@ class ASRWorker:
         import gigaam
         self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
 
+        # Load silero-vad (used for GigaAM speech segmentation, bypasses pyannote/torchcodec)
+        print("Loading silero-vad...")
+        from silero_vad import load_silero_vad
+        self.silero_vad = load_silero_vad()
+
         print("Loading pyannote diarization...")
         self.diarize_model = None
         if hf_token:
@@ -107,7 +117,7 @@ class ASRWorker:
                 os.environ["HF_HUB_OFFLINE"] = "0"
                 self.diarize_model = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
-                    use_auth_token=hf_token,  # pyannote 3.1.1 uses use_auth_token
+                    token=hf_token,  # pyannote 4.x uses 'token' (not 'use_auth_token')
                 ).to(torch.device(self.device))
                 os.environ["HF_HUB_OFFLINE"] = "1"
                 print("Diarization model loaded.")
@@ -163,7 +173,6 @@ class ASRWorker:
             return {"error": str(e), "traceback": traceback.format_exc()}
 
         finally:
-            import os
             if audio_path and os.path.exists(audio_path):
                 os.unlink(audio_path)
 
@@ -221,7 +230,6 @@ class ASRWorker:
                     kwargs["min_speakers"] = min_speakers
                 if max_speakers > 1:
                     kwargs["max_speakers"] = max_speakers
-                # Convert to wav for pyannote (torchaudio has issues with m4a/mp4)
                 wav_path = audio_path + ".wav"
                 subprocess.run(
                     ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
@@ -242,13 +250,62 @@ class ASRWorker:
         ], detected_lang
 
     def _run_gigaam(self, audio_path, enable_diarization, min_speakers, max_speakers):
-        raw = self.gigaam_model.transcribe_longform(audio_path)
+        import torchaudio
+        from silero_vad import read_audio, get_speech_timestamps
+
+        # Load audio with silero-vad's read_audio (resamples to 16kHz, returns 1D tensor)
+        # This avoids pyannote's torchcodec dependency entirely
+        waveform = read_audio(audio_path)  # 1D float32 tensor at 16kHz
+
+        # Find speech segments using silero-vad (pure PyTorch, no FFmpeg/torchcodec)
+        print(f"Running silero-vad on {len(waveform) / 16000:.1f}s of audio...")
+        speech_timestamps = get_speech_timestamps(
+            waveform,
+            self.silero_vad,
+            sampling_rate=16000,
+            min_silence_duration_ms=500,
+            min_speech_duration_ms=250,
+            threshold=0.5,
+        )
+        print(f"Found {len(speech_timestamps)} speech segments")
+
+        # Transcribe each segment with GigaAM (requires file path, not numpy)
         segments = []
-        for chunk in raw:
-            start, end = chunk["boundaries"]
-            text = chunk["transcription"].strip()
-            if text:
-                segments.append({"start": float(start), "end": float(end), "text": text})
+        chunk_paths = []
+
+        try:
+            for ts in speech_timestamps:
+                start_sample = ts["start"]
+                end_sample = ts["end"]
+                start_sec = start_sample / 16000.0
+                end_sec = end_sample / 16000.0
+
+                chunk = waveform[start_sample:end_sample].unsqueeze(0)  # (1, time)
+                if chunk.shape[1] < 800:  # skip chunks < 50ms
+                    continue
+
+                # Write segment to temp wav (GigaAM.transcribe() requires a file path)
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                tmp.close()
+                chunk_paths.append(tmp.name)
+                torchaudio.save(tmp.name, chunk, 16000, format="wav")
+
+                try:
+                    text = self.gigaam_model.transcribe(tmp.name)
+                    if text and text.strip():
+                        segments.append({
+                            "start": float(start_sec),
+                            "end": float(end_sec),
+                            "text": text.strip(),
+                        })
+                except Exception as e:
+                    print(f"GigaAM chunk error at {start_sec:.1f}s: {e}")
+        finally:
+            for p in chunk_paths:
+                if os.path.exists(p):
+                    os.unlink(p)
+
+        print(f"GigaAM transcribed {len(segments)} segments")
 
         if enable_diarization and self.diarize_model and segments:
             try:
@@ -257,7 +314,6 @@ class ASRWorker:
                     kwargs["min_speakers"] = min_speakers
                 if max_speakers > 1:
                     kwargs["max_speakers"] = max_speakers
-                # Convert to wav for pyannote (torchaudio has issues with m4a/mp4)
                 wav_path = audio_path + ".wav"
                 subprocess.run(
                     ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
