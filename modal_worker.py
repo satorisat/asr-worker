@@ -185,6 +185,8 @@ class ASRWorker:
             return 0.0
 
     def _run_gigaam(self, audio_path, enable_diarization, min_speakers, max_speakers):
+        import concurrent.futures
+
         # Конвертируем один раз — используется и GigaAM, и pyannote
         wav_path = audio_path + ".wav"
         subprocess.run(
@@ -194,18 +196,24 @@ class ASRWorker:
         input_path = wav_path if os.path.exists(wav_path) else audio_path
 
         try:
-            segments = self._transcribe(input_path)
+            if enable_diarization and self.diarize_model:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    transcribe_future = executor.submit(self._transcribe, input_path)
+                    diarize_future = executor.submit(self._diarize, input_path, min_speakers, max_speakers)
 
-            if enable_diarization and self.diarize_model and segments:
-                diarize_result = self._diarize(input_path, min_speakers, max_speakers)
-                if diarize_result is not None:
+                    segments = transcribe_future.result()
+                    diarize_result = diarize_future.result()
+
+                if diarize_result is not None and segments:
                     segments = self._assign_speakers(segments, diarize_result)
                 else:
                     for seg in segments:
                         seg["speaker"] = "SPEAKER_00"
-            elif enable_diarization:
-                for seg in segments:
-                    seg["speaker"] = "SPEAKER_00"
+            else:
+                segments = self._transcribe(input_path)
+                if enable_diarization:
+                    for seg in segments:
+                        seg["speaker"] = "SPEAKER_00"
         finally:
             if os.path.exists(wav_path):
                 os.unlink(wav_path)
