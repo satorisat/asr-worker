@@ -185,7 +185,9 @@ class ASRWorker:
             return 0.0
 
     def _run_gigaam(self, audio_path, enable_diarization, min_speakers, max_speakers):
-        # soundfile (pyannote backend) doesn't support m4a/mp4 — convert to wav first
+        import concurrent.futures
+
+        # Конвертируем один раз — используется и GigaAM, и pyannote
         wav_path = audio_path + ".wav"
         subprocess.run(
             ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
@@ -193,47 +195,58 @@ class ASRWorker:
         )
         input_path = wav_path if os.path.exists(wav_path) else audio_path
 
-        print("Running GigaAM transcribe_longform...")
         try:
-            utterances = self.gigaam_model.transcribe_longform(input_path)
+            if enable_diarization and self.diarize_model:
+                # Запускаем транскрипцию и диаризацию параллельно
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    transcribe_future = executor.submit(self._transcribe, input_path)
+                    diarize_future = executor.submit(self._diarize, input_path, min_speakers, max_speakers)
+
+                    segments = transcribe_future.result()
+                    diarize_result = diarize_future.result()
+
+                if diarize_result is not None and segments:
+                    segments = self._assign_speakers(segments, diarize_result)
+                else:
+                    for seg in segments:
+                        seg["speaker"] = "SPEAKER_00"
+            else:
+                segments = self._transcribe(input_path)
+                if enable_diarization:
+                    for seg in segments:
+                        seg["speaker"] = "SPEAKER_00"
         finally:
             if os.path.exists(wav_path):
                 os.unlink(wav_path)
 
+        return segments
+
+    def _transcribe(self, input_path):
+        print("Running GigaAM transcribe_longform...")
+        utterances = self.gigaam_model.transcribe_longform(input_path)
         segments = []
         for utt in utterances:
             text = utt["transcription"].strip()
             start, end = utt["boundaries"]
             if text:
                 segments.append({"start": float(start), "end": float(end), "text": text})
-
         print(f"GigaAM transcribed {len(segments)} segments")
-
-        if enable_diarization and self.diarize_model and segments:
-            try:
-                kwargs = {}
-                if min_speakers > 1:
-                    kwargs["min_speakers"] = min_speakers
-                if max_speakers > 1:
-                    kwargs["max_speakers"] = max_speakers
-                wav_path = audio_path + ".wav"
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
-                    capture_output=True,
-                )
-                diarize_input = wav_path if os.path.exists(wav_path) else audio_path
-                diarize_result = self.diarize_model(diarize_input, **kwargs)
-                if os.path.exists(wav_path):
-                    os.unlink(wav_path)
-                segments = self._assign_speakers(segments, diarize_result)
-                print("Diarization complete.")
-            except Exception as e:
-                print(f"Diarization failed: {e}")
-        elif enable_diarization:
-            for seg in segments:
-                seg["speaker"] = "SPEAKER_00"
-
         return segments
+
+    def _diarize(self, input_path, min_speakers, max_speakers):
+        print("Running diarization...")
+        try:
+            kwargs = {}
+            if min_speakers > 1:
+                kwargs["min_speakers"] = min_speakers
+            if max_speakers > 1:
+                kwargs["max_speakers"] = max_speakers
+            result = self.diarize_model(input_path, **kwargs)
+            print("Diarization done.")
+            return result
+        except Exception as e:
+            print(f"Diarization failed: {e}")
+            return None
 
     def _assign_speakers(self, segments, diarize_result):
         speaker_turns = []
