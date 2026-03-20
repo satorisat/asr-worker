@@ -341,6 +341,7 @@ class WhisperWorker:
             "language": language,
             "duration": duration,
             "word_count": word_count,
+            "diarization_available": self.diarize_model is not None,
         }
 
     def _build_formatted_text(self, segments):

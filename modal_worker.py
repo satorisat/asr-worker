@@ -202,6 +202,7 @@ class ASRWorker:
                 "language": "ru",
                 "duration": duration,
                 "word_count": len(full_text.split()),
+                "diarization_available": self.diarize_model is not None,
             }
 
         except Exception as e:
