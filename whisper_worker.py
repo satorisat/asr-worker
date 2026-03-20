@@ -26,8 +26,8 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
     .pip_install(
-        "torch==2.3.1",
-        "torchaudio==2.3.1",
+        "torch==2.4.1",
+        "torchaudio==2.4.1",
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
