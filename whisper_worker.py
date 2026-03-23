@@ -91,7 +91,7 @@ image = (
     image=image,
     secrets=[
         modal.Secret.from_name("hf-token"),
-        modal.Secret.from_name("worker-auth-token", required=False),
+        modal.Secret.from_name("worker-auth-token"),
     ],
     volumes={CACHE_DIR: volume},
     scaledown_window=2,

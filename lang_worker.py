@@ -67,7 +67,7 @@ image = (
 
 @app.cls(
     image=image,
-    secrets=[modal.Secret.from_name("worker-auth-token", required=False)],
+    secrets=[modal.Secret.from_name("worker-auth-token")],
     volumes={CACHE_DIR: volume},
     scaledown_window=2,
     timeout=120,
