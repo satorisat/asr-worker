@@ -94,7 +94,7 @@ image = (
         modal.Secret.from_name("worker-auth-token", required=False),
     ],
     volumes={CACHE_DIR: volume},
-    scaledown_window=1,
+    scaledown_window=2,
     timeout=3600,
     enable_memory_snapshot=True,
 )
