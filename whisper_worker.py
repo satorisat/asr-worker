@@ -258,7 +258,7 @@ class WhisperWorker:
             language=lang_arg,
             beam_size=5,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
+            vad_parameters={"min_silence_duration_ms": 1500, "speech_pad_ms": 400},
         )
 
         segments = []
