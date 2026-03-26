@@ -15,6 +15,8 @@ import subprocess
 import traceback
 
 import modal
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 app = modal.App("asr-worker")
 
@@ -161,8 +163,8 @@ class ASRWorker:
 
         print("All models loaded. Worker ready.")
 
-    @modal.fastapi_endpoint(method="POST")
-    def transcribe(self, request: dict) -> dict:
+    @modal.method()
+    def do_transcribe(self, request: dict) -> dict:
         if getattr(self, "_load_error", None):
             return {"error": f"Worker initialization failed: {self._load_error}"}
 
@@ -170,10 +172,6 @@ class ASRWorker:
         enable_diarization = request.get("enable_diarization", True)
         min_speakers = _safe_int(request.get("min_speakers", 1), 1)
         max_speakers = _safe_int(request.get("max_speakers", 4), 4)
-
-        worker_token = os.environ.get("WORKER_AUTH_TOKEN", "")
-        if worker_token and request.get("auth_token") != worker_token:
-            return {"error": "Unauthorized"}
 
         if not audio_url:
             return {"error": "audio_url is required"}
@@ -372,3 +370,55 @@ class ASRWorker:
             except ValueError:
                 pass
         return speaker_id
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app — submit / poll pattern
+# ---------------------------------------------------------------------------
+
+fastapi_app = FastAPI()
+
+
+@app.function(
+    image=image,
+    secrets=[
+        modal.Secret.from_name("hf-token"),
+        modal.Secret.from_name("worker-auth-token"),
+    ],
+)
+@modal.asgi_app()
+def web():
+    return fastapi_app
+
+
+@fastapi_app.post("/transcribe")
+async def submit_transcribe(request: dict):
+    worker_token = os.environ.get("WORKER_AUTH_TOKEN", "")
+    if worker_token and request.get("auth_token") != worker_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not request.get("audio_url"):
+        raise HTTPException(status_code=400, detail="audio_url is required")
+
+    try:
+        worker = ASRWorker()
+        fc = worker.do_transcribe.spawn(request)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to spawn worker: {e}")
+
+    return {"call_id": fc.object_id}
+
+
+@fastapi_app.get("/result/{call_id}")
+async def get_result(call_id: str):
+    try:
+        fc = modal.FunctionCall.from_id(call_id)
+    except Exception as e:
+        return JSONResponse(status_code=404, content={"error": f"Unknown call_id: {e}"})
+
+    try:
+        result = fc.get(timeout=0)
+        return result
+    except TimeoutError:
+        return JSONResponse(status_code=202, content={"status": "processing"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
