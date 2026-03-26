@@ -376,6 +376,7 @@ class ASRWorker:
 
 @app.function(
     image=image,
+    scaledown_window=2,
     secrets=[
         modal.Secret.from_name("hf-token"),
         modal.Secret.from_name("worker-auth-token"),
