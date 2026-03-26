@@ -409,7 +409,7 @@ def web():
             return JSONResponse(status_code=404, content={"error": f"Unknown call_id: {e}"})
 
         try:
-            result = fc.get(timeout=0)
+            result = await fc.get.aio(timeout=0)
             return result
         except TimeoutError:
             return JSONResponse(status_code=202, content={"status": "processing"})
