@@ -56,45 +56,6 @@ def _safe_int(value, default: int) -> int:
 # Image — GigaAM + pyannote
 # ---------------------------------------------------------------------------
 
-
-def _prefetch_gigaam_weights():
-    """Download GigaAM v3 weights at image-build time so runtime containers
-    never touch Sber CDN. Runs inside the image during `modal deploy` with
-    no GPU — we only fetch files, no torch model instantiation. Retries up
-    to 5 times with cache cleanup. CDN flakiness is contained here, not
-    in prod request latency."""
-    import os
-    import shutil
-    import sys
-    import time as _time
-    import traceback
-    # Call gigaam's internal download helpers directly — avoids torch/CUDA init
-    # that gigaam.load_model() triggers (and which fails without a GPU).
-    from gigaam import _download_model, _download_tokenizer
-
-    download_root = os.path.expanduser("~/.cache/gigaam")
-    cache_dirs = (download_root, "/root/.cache/gigaam")
-    last_err = None
-    for attempt in range(1, 6):
-        try:
-            print(f"[prefetch] attempt {attempt}/5: downloading GigaAM v3_e2e_rnnt", flush=True)
-            os.makedirs(download_root, exist_ok=True)
-            _download_model("v3_e2e_rnnt", download_root)
-            _download_tokenizer("v3_e2e_rnnt", download_root)
-            print(f"[prefetch] GigaAM weights cached on attempt {attempt}", flush=True)
-            return
-        except Exception as e:
-            last_err = e
-            print(f"[prefetch] attempt {attempt}/5 failed: {type(e).__name__}: {e}", flush=True)
-            for cache_dir in cache_dirs:
-                if os.path.exists(cache_dir):
-                    shutil.rmtree(cache_dir, ignore_errors=True)
-            if attempt < 5:
-                _time.sleep(min(2 ** attempt, 30))
-    print(traceback.format_exc(), file=sys.stderr, flush=True)
-    raise RuntimeError(f"GigaAM prefetch failed after 5 attempts: {last_err}")
-
-
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
@@ -117,10 +78,6 @@ image = (
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
-    # Bake GigaAM weights (428MB) into the image at build time.
-    # Runtime containers inherit /root/.cache/gigaam from the image layer —
-    # no Sber CDN on cold start, no per-container re-download under load.
-    .run_function(_prefetch_gigaam_weights)
 )
 
 
@@ -174,18 +131,22 @@ class ASRWorker:
                 return Model.from_pretrained(model_id, use_auth_token=os.environ.get("HF_TOKEN"))
         _vad.load_segmentation_model = _patched_load_segmentation_model
 
-        # GigaAM weights live in /root/.cache/gigaam (local FS). Modal memory snapshot
-        # includes FS, so a cached checkpoint is normally instant. But if Sber CDN drops
-        # SSL mid-download, a partial .ckpt can get baked into the snapshot and fail
-        # checksum every cold start. Strategy: try load as-is first (fast path); on any
-        # failure wipe cache and retry with backoff.
-        gigaam_caches = ("/root/.cache/gigaam", os.path.expanduser("~/.cache/gigaam"))
+        # Download GigaAM weights into the persistent Modal Volume (Modal-recommended
+        # pattern for model weights, mirrors what Whisper already does). First successful
+        # container skills the volume; all subsequent cold starts read from volume with no
+        # network. On corrupt/partial file we wipe the cached path and retry with backoff.
+        gigaam_cache = os.path.join(CACHE_DIR, "gigaam")
+        os.makedirs(gigaam_cache, exist_ok=True)
 
         print("Loading GigaAM v3...")
         last_err = None
+        downloaded_fresh = False
         for attempt in range(1, 6):
             try:
-                self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
+                had_files_before = bool(os.listdir(gigaam_cache))
+                self.gigaam_model = gigaam.load_model("v3_e2e_rnnt", download_root=gigaam_cache)
+                if not had_files_before:
+                    downloaded_fresh = True
                 if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
                     self.gigaam_model = self.gigaam_model.to(self.device)
                     print(f"GigaAM moved to {self.device}")
@@ -193,10 +154,9 @@ class ASRWorker:
             except Exception as e:
                 last_err = e
                 print(f"GigaAM load attempt {attempt}/5 failed: {type(e).__name__}: {e}")
-                # Wipe cache before retry — covers both partial downloads and corrupt snapshot files
-                for cache_dir in gigaam_caches:
-                    if os.path.exists(cache_dir):
-                        shutil.rmtree(cache_dir, ignore_errors=True)
+                # Wipe cached path before retry — covers partial downloads and checksum failures
+                shutil.rmtree(gigaam_cache, ignore_errors=True)
+                os.makedirs(gigaam_cache, exist_ok=True)
                 if attempt < 5:
                     time.sleep(min(2 ** attempt, 30))
         else:
@@ -204,6 +164,15 @@ class ASRWorker:
             # returning errors to every request. Raise so Modal kills it and spawns fresh.
             print(f"FATAL: GigaAM failed to load after 5 attempts:\n{traceback.format_exc()}")
             raise RuntimeError(f"GigaAM load failed: {type(last_err).__name__}: {last_err}")
+
+        # If this container was the one that populated the volume, commit so that
+        # future cold starts see the cached weights without re-downloading.
+        if downloaded_fresh:
+            try:
+                volume.commit()
+                print("GigaAM weights committed to volume")
+            except Exception as e:
+                print(f"Warning: volume.commit() failed: {e}")
 
         print("Loading pyannote diarization...")
         self.diarize_model = None
