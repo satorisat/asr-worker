@@ -56,6 +56,37 @@ def _safe_int(value, default: int) -> int:
 # Image — GigaAM + pyannote
 # ---------------------------------------------------------------------------
 
+
+def _prefetch_gigaam_weights():
+    """Download GigaAM v3 weights at image-build time so runtime containers
+    never touch Sber CDN. Runs inside the image during `modal deploy`.
+    Retries up to 5 times with cache cleanup — CDN flakiness during build
+    is contained here, not in prod request latency."""
+    import os
+    import shutil
+    import time as _time
+    import traceback
+    import gigaam
+
+    cache_dirs = ("/root/.cache/gigaam", os.path.expanduser("~/.cache/gigaam"))
+    last_err = None
+    for attempt in range(1, 6):
+        try:
+            gigaam.load_model("v3_e2e_rnnt")
+            print(f"[prefetch] GigaAM weights cached on attempt {attempt}")
+            return
+        except Exception as e:
+            last_err = e
+            print(f"[prefetch] attempt {attempt}/5 failed: {type(e).__name__}: {e}")
+            for cache_dir in cache_dirs:
+                if os.path.exists(cache_dir):
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+            if attempt < 5:
+                _time.sleep(min(2 ** attempt, 30))
+    print(traceback.format_exc())
+    raise RuntimeError(f"GigaAM prefetch failed after 5 attempts: {last_err}")
+
+
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
@@ -78,6 +109,10 @@ image = (
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
+    # Bake GigaAM weights (428MB) into the image at build time.
+    # Runtime containers inherit /root/.cache/gigaam from the image layer —
+    # no Sber CDN on cold start, no per-container re-download under load.
+    .run_function(_prefetch_gigaam_weights)
 )
 
 
