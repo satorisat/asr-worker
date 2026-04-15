@@ -102,6 +102,7 @@ class WhisperWorker:
 
     @modal.enter()
     def load_models(self):
+        import time
         import torch
         from faster_whisper import WhisperModel
         from pyannote.audio import Pipeline
@@ -118,18 +119,27 @@ class WhisperWorker:
         print(f"Device: {self.device}")
 
         print("Loading Whisper large-v3-turbo...")
-        try:
-            self.whisper_model = WhisperModel(
-                "large-v3-turbo",
-                device=self.device,
-                compute_type="float16" if self.device == "cuda" else "int8",
-                download_root=os.path.join(CACHE_DIR, "whisper"),
-            )
-            print("Whisper loaded.")
-        except Exception as e:
-            self._load_error = f"{type(e).__name__}: {e}"
-            print(f"FATAL: Whisper failed to load:\n{traceback.format_exc()}")
-            return  # skip diarization loading too
+        whisper_download_root = os.path.join(CACHE_DIR, "whisper")
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                self.whisper_model = WhisperModel(
+                    "large-v3-turbo",
+                    device=self.device,
+                    compute_type="float16" if self.device == "cuda" else "int8",
+                    download_root=whisper_download_root,
+                )
+                print("Whisper loaded.")
+                break
+            except Exception as e:
+                last_err = e
+                print(f"Whisper load attempt {attempt}/3 failed: {type(e).__name__}: {e}")
+                if attempt < 3:
+                    time.sleep(min(2 ** attempt, 30))
+        else:
+            # Raise so Modal kills the broken container instead of caching the error.
+            print(f"FATAL: Whisper failed to load after 3 attempts:\n{traceback.format_exc()}")
+            raise RuntimeError(f"Whisper load failed: {type(last_err).__name__}: {last_err}")
 
         print("Loading pyannote diarization...")
         self.diarize_model = None

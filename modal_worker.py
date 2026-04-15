@@ -131,15 +131,12 @@ class ASRWorker:
                 return Model.from_pretrained(model_id, use_auth_token=os.environ.get("HF_TOKEN"))
         _vad.load_segmentation_model = _patched_load_segmentation_model
 
-        # Wipe gigaam cache on every start: Sber CDN occasionally drops SSL mid-download,
-        # leaving a partial .ckpt that fails checksum on next load. Modal's memory snapshot
-        # also captures container FS, so a partial file can get baked in and poison every
-        # subsequent cold start. Starting clean every time is cheap and safe.
+        # GigaAM weights live in /root/.cache/gigaam (local FS). Modal memory snapshot
+        # includes FS, so a cached checkpoint is normally instant. But if Sber CDN drops
+        # SSL mid-download, a partial .ckpt can get baked into the snapshot and fail
+        # checksum every cold start. Strategy: try load as-is first (fast path); on any
+        # failure wipe cache and retry with backoff.
         gigaam_caches = ("/root/.cache/gigaam", os.path.expanduser("~/.cache/gigaam"))
-        for cache_dir in gigaam_caches:
-            if os.path.exists(cache_dir):
-                print(f"Wiping gigaam cache: {cache_dir}")
-                shutil.rmtree(cache_dir, ignore_errors=True)
 
         print("Loading GigaAM v3...")
         last_err = None
@@ -153,9 +150,10 @@ class ASRWorker:
             except Exception as e:
                 last_err = e
                 print(f"GigaAM load attempt {attempt}/5 failed: {type(e).__name__}: {e}")
-                # Remove partial/corrupt download before retry
+                # Wipe cache before retry — covers both partial downloads and corrupt snapshot files
                 for cache_dir in gigaam_caches:
-                    shutil.rmtree(cache_dir, ignore_errors=True)
+                    if os.path.exists(cache_dir):
+                        shutil.rmtree(cache_dir, ignore_errors=True)
                 if attempt < 5:
                     time.sleep(min(2 ** attempt, 30))
         else:
