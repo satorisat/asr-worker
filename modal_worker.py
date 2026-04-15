@@ -59,31 +59,39 @@ def _safe_int(value, default: int) -> int:
 
 def _prefetch_gigaam_weights():
     """Download GigaAM v3 weights at image-build time so runtime containers
-    never touch Sber CDN. Runs inside the image during `modal deploy`.
-    Retries up to 5 times with cache cleanup — CDN flakiness during build
-    is contained here, not in prod request latency."""
+    never touch Sber CDN. Runs inside the image during `modal deploy` with
+    no GPU — we only fetch files, no torch model instantiation. Retries up
+    to 5 times with cache cleanup. CDN flakiness is contained here, not
+    in prod request latency."""
     import os
     import shutil
+    import sys
     import time as _time
     import traceback
-    import gigaam
+    # Call gigaam's internal download helpers directly — avoids torch/CUDA init
+    # that gigaam.load_model() triggers (and which fails without a GPU).
+    from gigaam import _download_model, _download_tokenizer
 
-    cache_dirs = ("/root/.cache/gigaam", os.path.expanduser("~/.cache/gigaam"))
+    download_root = os.path.expanduser("~/.cache/gigaam")
+    cache_dirs = (download_root, "/root/.cache/gigaam")
     last_err = None
     for attempt in range(1, 6):
         try:
-            gigaam.load_model("v3_e2e_rnnt")
-            print(f"[prefetch] GigaAM weights cached on attempt {attempt}")
+            print(f"[prefetch] attempt {attempt}/5: downloading GigaAM v3_e2e_rnnt", flush=True)
+            os.makedirs(download_root, exist_ok=True)
+            _download_model("v3_e2e_rnnt", download_root)
+            _download_tokenizer("v3_e2e_rnnt", download_root)
+            print(f"[prefetch] GigaAM weights cached on attempt {attempt}", flush=True)
             return
         except Exception as e:
             last_err = e
-            print(f"[prefetch] attempt {attempt}/5 failed: {type(e).__name__}: {e}")
+            print(f"[prefetch] attempt {attempt}/5 failed: {type(e).__name__}: {e}", flush=True)
             for cache_dir in cache_dirs:
                 if os.path.exists(cache_dir):
                     shutil.rmtree(cache_dir, ignore_errors=True)
             if attempt < 5:
                 _time.sleep(min(2 ** attempt, 30))
-    print(traceback.format_exc())
+    print(traceback.format_exc(), file=sys.stderr, flush=True)
     raise RuntimeError(f"GigaAM prefetch failed after 5 attempts: {last_err}")
 
 
