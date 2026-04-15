@@ -101,6 +101,8 @@ class ASRWorker:
 
     @modal.enter()
     def load_models(self):
+        import shutil
+        import time
         import torch
         from pyannote.audio import Pipeline
         import gigaam
@@ -129,16 +131,38 @@ class ASRWorker:
                 return Model.from_pretrained(model_id, use_auth_token=os.environ.get("HF_TOKEN"))
         _vad.load_segmentation_model = _patched_load_segmentation_model
 
+        # Wipe gigaam cache on every start: Sber CDN occasionally drops SSL mid-download,
+        # leaving a partial .ckpt that fails checksum on next load. Modal's memory snapshot
+        # also captures container FS, so a partial file can get baked in and poison every
+        # subsequent cold start. Starting clean every time is cheap and safe.
+        gigaam_caches = ("/root/.cache/gigaam", os.path.expanduser("~/.cache/gigaam"))
+        for cache_dir in gigaam_caches:
+            if os.path.exists(cache_dir):
+                print(f"Wiping gigaam cache: {cache_dir}")
+                shutil.rmtree(cache_dir, ignore_errors=True)
+
         print("Loading GigaAM v3...")
-        try:
-            self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
-            if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
-                self.gigaam_model = self.gigaam_model.to(self.device)
-                print(f"GigaAM moved to {self.device}")
-        except Exception as e:
-            self._load_error = f"{type(e).__name__}: {e}"
-            print(f"FATAL: GigaAM failed to load:\n{traceback.format_exc()}")
-            return  # skip diarization loading too
+        last_err = None
+        for attempt in range(1, 6):
+            try:
+                self.gigaam_model = gigaam.load_model("v3_e2e_rnnt")
+                if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
+                    self.gigaam_model = self.gigaam_model.to(self.device)
+                    print(f"GigaAM moved to {self.device}")
+                break
+            except Exception as e:
+                last_err = e
+                print(f"GigaAM load attempt {attempt}/5 failed: {type(e).__name__}: {e}")
+                # Remove partial/corrupt download before retry
+                for cache_dir in gigaam_caches:
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                if attempt < 5:
+                    time.sleep(min(2 ** attempt, 30))
+        else:
+            # Don't swallow into _load_error: that keeps the broken container alive
+            # returning errors to every request. Raise so Modal kills it and spawns fresh.
+            print(f"FATAL: GigaAM failed to load after 5 attempts:\n{traceback.format_exc()}")
+            raise RuntimeError(f"GigaAM load failed: {type(last_err).__name__}: {last_err}")
 
         print("Loading pyannote diarization...")
         self.diarize_model = None
