@@ -52,6 +52,28 @@ def _safe_int(value, default: int) -> int:
         return default
 
 
+def _hf_offline(on: bool):
+    v = "1" if on else "0"
+    os.environ["HF_HUB_OFFLINE"] = v
+    os.environ["TRANSFORMERS_OFFLINE"] = v
+
+
+def _load_offline_first(loader, what: str):
+    """Load from the volume HF cache with NO network; on a genuine cache miss (first-ever
+    container / wiped cache) fall back to a one-time online download, then re-assert offline.
+    Keeps a HuggingFace outage from breaking cold starts once the model is cached."""
+    _hf_offline(True)
+    try:
+        return loader()
+    except Exception as e:
+        print(f"{what}: offline cache miss ({type(e).__name__}: {e}) — downloading once online")
+        _hf_offline(False)
+        try:
+            return loader()
+        finally:
+            _hf_offline(True)
+
+
 # ---------------------------------------------------------------------------
 # Image — GigaAM + pyannote
 # ---------------------------------------------------------------------------
@@ -77,6 +99,12 @@ image = (
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
+        # ONE-TIME rebuild to pull the current GigaAM (the cached image still has the old
+        # version with the pre-LongformTranscriptionResult format). force_build overwrites the
+        # cache, so the new version persists after this flag is removed (Modal docs: MODAL_FORCE_BUILD
+        # "break[s] the cache ... even if the config is reverted"). REMOVE after deploy + test,
+        # otherwise it re-pulls GigaAM on every deploy.
+        force_build=True,
     )
 )
 
@@ -99,7 +127,10 @@ image = (
 )
 class ASRWorker:
 
-    @modal.enter()
+    # snap=True: runs BEFORE the memory snapshot. GPU is NOT available in this phase, so we
+    # load GigaAM and pyannote on CPU — that loaded state is captured in the snapshot. The
+    # CPU→GPU move happens in move_to_gpu (snap=False) after restore.
+    @modal.enter(snap=True)
     def load_models(self):
         import shutil
         import time
@@ -108,17 +139,14 @@ class ASRWorker:
         import gigaam
 
         self._load_error = None
+        self.device = "cpu"  # real device is set in move_to_gpu (GPU unavailable during snapshot)
 
         os.environ["HF_HOME"] = CACHE_DIR
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        _hf_offline(True)
         # GigaAM хранит веса в torch.hub dir — направляем в volume
         torch.hub.set_dir(CACHE_DIR)
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         hf_token = os.environ.get("HF_TOKEN", "")
-
-        print(f"Device: {self.device}")
 
         # Patch GigaAM vad_utils: passes local snapshot path to Model.from_pretrained()
         # but pyannote 3.3.2 expects a HF repo ID. Override to pass repo ID directly.
@@ -127,8 +155,12 @@ class ASRWorker:
             from pyannote.audio import Model
             from torch.torch_version import TorchVersion
             from pyannote.audio.core.task import Problem, Resolution, Specifications
-            with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
-                return Model.from_pretrained(model_id, use_auth_token=os.environ.get("HF_TOKEN"))
+            def _load():
+                with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
+                    return Model.from_pretrained(model_id, use_auth_token=os.environ.get("HF_TOKEN"))
+            # Called lazily by transcribe_longform's VAD (post-restore, offline). Route through
+            # offline-first so it self-heals on a cold cache instead of hard-failing offline.
+            return _load_offline_first(_load, f"VAD segmentation ({model_id})")
         _vad.load_segmentation_model = _patched_load_segmentation_model
 
         # Download GigaAM weights into the persistent Modal Volume (Modal-recommended
@@ -138,18 +170,17 @@ class ASRWorker:
         gigaam_cache = os.path.join(CACHE_DIR, "gigaam")
         os.makedirs(gigaam_cache, exist_ok=True)
 
-        print("Loading GigaAM v3...")
+        print("Loading GigaAM v3 (CPU, snapshot phase)...")
+        t0 = time.monotonic()
         last_err = None
         downloaded_fresh = False
         for attempt in range(1, 6):
             try:
                 had_files_before = bool(os.listdir(gigaam_cache))
+                # CPU load only — no .to(cuda) here (GPU unavailable in the snapshot phase).
                 self.gigaam_model = gigaam.load_model("v3_e2e_rnnt", download_root=gigaam_cache)
                 if not had_files_before:
                     downloaded_fresh = True
-                if self.device == "cuda" and hasattr(self.gigaam_model, "to"):
-                    self.gigaam_model = self.gigaam_model.to(self.device)
-                    print(f"GigaAM moved to {self.device}")
                 break
             except Exception as e:
                 last_err = e
@@ -164,6 +195,7 @@ class ASRWorker:
             # returning errors to every request. Raise so Modal kills it and spawns fresh.
             print(f"FATAL: GigaAM failed to load after 5 attempts:\n{traceback.format_exc()}")
             raise RuntimeError(f"GigaAM load failed: {type(last_err).__name__}: {last_err}")
+        print(f"GigaAM loaded (CPU) in {time.monotonic() - t0:.1f}s")
 
         # If this container was the one that populated the volume, commit so that
         # future cold starts see the cached weights without re-downloading.
@@ -174,26 +206,57 @@ class ASRWorker:
             except Exception as e:
                 print(f"Warning: volume.commit() failed: {e}")
 
-        print("Loading pyannote diarization...")
+        # pyannote on CPU, offline-first from the volume cache (was HF_HUB_OFFLINE=0 → online
+        # every cold start, which broke on the 2026-07-16 HF outage). Online only as a
+        # one-time fallback on a genuine cache miss. GPU move happens in move_to_gpu.
+        print("Loading pyannote diarization (CPU, offline-first)...")
+        t1 = time.monotonic()
         self.diarize_model = None
         if hf_token:
             try:
                 from torch.torch_version import TorchVersion
                 from pyannote.audio.core.task import Problem, Resolution, Specifications
-                os.environ["HF_HUB_OFFLINE"] = "0"
-                try:
+
+                def _load_diarize():
                     with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
-                        self.diarize_model = Pipeline.from_pretrained(
+                        return Pipeline.from_pretrained(
                             "pyannote/speaker-diarization-3.1",
                             use_auth_token=hf_token,
-                        ).to(torch.device(self.device))
-                    print("Diarization model loaded.")
-                finally:
-                    os.environ["HF_HUB_OFFLINE"] = "1"
+                        )
+
+                self.diarize_model = _load_offline_first(_load_diarize, "pyannote diarization")
+                print(f"Diarization loaded (CPU) in {time.monotonic() - t1:.1f}s")
             except Exception as e:
                 print(f"Warning: diarization failed to load: {e}")
 
-        print("All models loaded. Worker ready.")
+        print("Snapshot-phase load complete (models on CPU).")
+
+    # snap=False: runs AFTER snapshot restore (GPU available). Move the CPU-loaded models to
+    # GPU. Fast — weights are already in RAM from the snapshot, only the CPU→GPU transfer runs.
+    @modal.enter(snap=False)
+    def move_to_gpu(self):
+        import time
+        import torch
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Device: {self.device}")
+        if self.device != "cuda":
+            print("No GPU available — models stay on CPU.")
+            return
+
+        t0 = time.monotonic()
+        if getattr(self, "gigaam_model", None) is not None and hasattr(self.gigaam_model, "to"):
+            self.gigaam_model = self.gigaam_model.to(self.device)
+        if getattr(self, "diarize_model", None) is not None:
+            try:
+                self.diarize_model = self.diarize_model.to(torch.device(self.device))
+            except Exception as e:
+                # Don't leave it on CPU silently — diarization would then run at CPU speed on
+                # a GPU request path and risk a timeout. Disable it so behavior matches
+                # "diarization unavailable" (diarization_available:false) honestly.
+                print(f"Warning: moving diarization to GPU failed ({e}) — disabling diarization")
+                self.diarize_model = None
+        print(f"Models moved to {self.device} in {time.monotonic() - t0:.1f}s. Worker ready.")
 
     @modal.method()
     def do_transcribe(self, request: dict) -> dict:
@@ -318,11 +381,20 @@ class ASRWorker:
 
     def _transcribe(self, input_path):
         print("Running GigaAM transcribe_longform...")
-        utterances = self.gigaam_model.transcribe_longform(input_path)
+        result = self.gigaam_model.transcribe_longform(input_path)
+        # GigaAM changed transcribe_longform's return type across versions: newer releases
+        # return a LongformTranscriptionResult of Segment dataclasses (.text/.start/.end);
+        # older ones returned dicts ({"transcription","boundaries"}). Support both so a
+        # GigaAM version bump doesn't break us (mirrors the Beam gigaam worker).
+        utterances = getattr(result, "segments", result)
         segments = []
         for utt in utterances:
-            text = utt["transcription"].strip()
-            start, end = utt["boundaries"]
+            if isinstance(utt, dict):
+                text = (utt.get("transcription") or "").strip()
+                start, end = utt["boundaries"]
+            else:
+                text = (getattr(utt, "text", "") or "").strip()
+                start, end = utt.start, utt.end
             if text:
                 segments.append({"start": float(start), "end": float(end), "text": text})
         print(f"GigaAM transcribed {len(segments)} segments")

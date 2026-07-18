@@ -46,6 +46,28 @@ def _guess_suffix(url: str) -> str:
     return ext if ext else ".audio"
 
 
+def _hf_offline(on: bool):
+    v = "1" if on else "0"
+    os.environ["HF_HUB_OFFLINE"] = v
+    os.environ["TRANSFORMERS_OFFLINE"] = v
+
+
+def _load_offline_first(loader, what: str):
+    """Load from the volume HF cache with NO network; on a genuine cache miss (first-ever
+    container / wiped cache) fall back to a one-time online download, then re-assert offline.
+    Keeps a HuggingFace outage from breaking cold starts once the model is cached."""
+    _hf_offline(True)
+    try:
+        return loader()
+    except Exception as e:
+        print(f"{what}: offline cache miss ({type(e).__name__}: {e}) — downloading once online")
+        _hf_offline(False)
+        try:
+            return loader()
+        finally:
+            _hf_offline(True)
+
+
 # ---------------------------------------------------------------------------
 # Image — faster-whisper (CPU)
 # ---------------------------------------------------------------------------
@@ -75,27 +97,38 @@ image = (
 )
 class LangWorker:
 
-    @modal.enter()
+    # snap=True: run BEFORE the memory snapshot so the loaded CPU model is captured — later
+    # cold starts restore it instead of re-loading. This worker is CPU-only, so the whole
+    # load fits in the snapshot phase (no GPU move needed).
+    @modal.enter(snap=True)
     def load_models(self):
+        import time
         from faster_whisper import WhisperModel
 
         self._load_error = None
-
         os.environ["HF_HOME"] = CACHE_DIR
+        _hf_offline(True)
 
-        print("Loading Whisper tiny...")
+        print("Loading Whisper tiny (CPU, snapshot phase, offline-first)...")
+        t0 = time.monotonic()
         try:
             # cpu + int8 — минимальные ресурсы, достаточная точность для языка
-            self.model = WhisperModel(
-                "tiny",
-                device="cpu",
-                compute_type="int8",
-                download_root=os.path.join(CACHE_DIR, "whisper"),
+            self.model = _load_offline_first(
+                lambda: WhisperModel(
+                    "tiny",
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=os.path.join(CACHE_DIR, "whisper"),
+                ),
+                "faster-whisper tiny",
             )
-            print("Whisper tiny loaded. Worker ready.")
+            print(f"Whisper tiny loaded in {time.monotonic() - t0:.1f}s. Worker ready.")
         except Exception as e:
-            self._load_error = f"{type(e).__name__}: {e}"
+            # Under snap=True a swallowed failure would be baked into the shared snapshot →
+            # every restored container stays broken until redeploy. Raise so Modal discards
+            # this container and doesn't snapshot a model-less state (mirrors modal_worker).
             print(f"FATAL: Whisper tiny failed to load:\n{traceback.format_exc()}")
+            raise RuntimeError(f"Whisper tiny load failed: {type(e).__name__}: {e}")
 
     @modal.fastapi_endpoint(method="POST")
     def detect(self, request: dict) -> dict:

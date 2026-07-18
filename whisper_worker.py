@@ -82,6 +82,28 @@ image = (
 )
 
 
+def _hf_offline(on: bool):
+    v = "1" if on else "0"
+    os.environ["HF_HUB_OFFLINE"] = v
+    os.environ["TRANSFORMERS_OFFLINE"] = v
+
+
+def _load_offline_first(loader, what: str):
+    """Load from the volume HF cache with NO network; on a genuine cache miss (first-ever
+    container / wiped cache) fall back to a one-time online download, then re-assert offline.
+    Keeps a HuggingFace outage from breaking cold starts once the model is cached."""
+    _hf_offline(True)
+    try:
+        return loader()
+    except Exception as e:
+        print(f"{what}: offline cache miss ({type(e).__name__}: {e}) — downloading once online")
+        _hf_offline(False)
+        try:
+            return loader()
+        finally:
+            _hf_offline(True)
+
+
 # ---------------------------------------------------------------------------
 # Worker class
 # ---------------------------------------------------------------------------
@@ -110,24 +132,26 @@ class WhisperWorker:
         self._load_error = None
 
         os.environ["HF_HOME"] = CACHE_DIR
-        os.environ["HF_HUB_OFFLINE"] = "1"
-        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        _hf_offline(True)
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         hf_token = os.environ.get("HF_TOKEN", "")
 
         print(f"Device: {self.device}")
 
-        print("Loading Whisper large-v3-turbo...")
+        print("Loading Whisper large-v3-turbo (offline-first)...")
         whisper_download_root = os.path.join(CACHE_DIR, "whisper")
         last_err = None
         for attempt in range(1, 4):
             try:
-                self.whisper_model = WhisperModel(
-                    "large-v3-turbo",
-                    device=self.device,
-                    compute_type="float16" if self.device == "cuda" else "int8",
-                    download_root=whisper_download_root,
+                self.whisper_model = _load_offline_first(
+                    lambda: WhisperModel(
+                        "large-v3-turbo",
+                        device=self.device,
+                        compute_type="float16" if self.device == "cuda" else "int8",
+                        download_root=whisper_download_root,
+                    ),
+                    "faster-whisper large-v3-turbo",
                 )
                 print("Whisper loaded.")
                 break
@@ -141,27 +165,32 @@ class WhisperWorker:
             print(f"FATAL: Whisper failed to load after 3 attempts:\n{traceback.format_exc()}")
             raise RuntimeError(f"Whisper load failed: {type(last_err).__name__}: {last_err}")
 
-        print("Loading pyannote diarization...")
+        # pyannote: offline-first from the volume cache (was HF_HUB_OFFLINE=0 → online every
+        # cold start, which broke on the 2026-07-16 HF outage). Online only as a one-time
+        # fallback on a genuine cache miss.
+        print("Loading pyannote diarization (offline-first)...")
         self.diarize_model = None
         if hf_token:
             try:
                 from contextlib import nullcontext
                 from torch.torch_version import TorchVersion
                 from pyannote.audio.core.task import Problem, Resolution, Specifications
-                os.environ["HF_HUB_OFFLINE"] = "0"
-                try:
+
+                def _load_diarize():
                     if hasattr(torch.serialization, "safe_globals"):
                         ctx = torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution])
                     else:
                         ctx = nullcontext()
                     with ctx:
-                        self.diarize_model = Pipeline.from_pretrained(
+                        return Pipeline.from_pretrained(
                             "pyannote/speaker-diarization-3.1",
                             use_auth_token=hf_token,
-                        ).to(torch.device(self.device))
-                    print("Diarization model loaded.")
-                finally:
-                    os.environ["HF_HUB_OFFLINE"] = "1"
+                        )
+
+                self.diarize_model = _load_offline_first(
+                    _load_diarize, "pyannote diarization"
+                ).to(torch.device(self.device))
+                print("Diarization model loaded.")
             except Exception as e:
                 print(f"Warning: diarization failed to load: {e}")
 
