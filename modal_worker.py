@@ -99,12 +99,6 @@ image = (
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
-        # ONE-TIME rebuild to pull the current GigaAM (the cached image still has the old
-        # version with the pre-LongformTranscriptionResult format). force_build overwrites the
-        # cache, so the new version persists after this flag is removed (Modal docs: MODAL_FORCE_BUILD
-        # "break[s] the cache ... even if the config is reverted"). REMOVE after deploy + test,
-        # otherwise it re-pulls GigaAM on every deploy.
-        force_build=True,
     )
 )
 

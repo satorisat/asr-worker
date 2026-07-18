@@ -93,24 +93,21 @@ image = (
     volumes={CACHE_DIR: volume},
     scaledown_window=2,
     timeout=120,
-    enable_memory_snapshot=True,
 )
 class LangWorker:
 
-    # snap=True: run BEFORE the memory snapshot so the loaded CPU model is captured — later
-    # cold starts restore it instead of re-loading. This worker is CPU-only, so the whole
-    # load fits in the snapshot phase (no GPU move needed).
-    @modal.enter(snap=True)
+    # No memory snapshot: tiny loads in ~0.4s, so a snapshot saves nothing (cold start is
+    # dominated by Modal container spin-up, not the load) — and ct2/faster-whisper native
+    # state doesn't survive restore cleanly (observed exit 139 segfault). Offline-first stays.
+    @modal.enter()
     def load_models(self):
-        import time
         from faster_whisper import WhisperModel
 
         self._load_error = None
         os.environ["HF_HOME"] = CACHE_DIR
         _hf_offline(True)
 
-        print("Loading Whisper tiny (CPU, snapshot phase, offline-first)...")
-        t0 = time.monotonic()
+        print("Loading Whisper tiny...")
         try:
             # cpu + int8 — минимальные ресурсы, достаточная точность для языка
             self.model = _load_offline_first(
@@ -122,11 +119,8 @@ class LangWorker:
                 ),
                 "faster-whisper tiny",
             )
-            print(f"Whisper tiny loaded in {time.monotonic() - t0:.1f}s. Worker ready.")
+            print("Whisper tiny loaded. Worker ready.")
         except Exception as e:
-            # Under snap=True a swallowed failure would be baked into the shared snapshot →
-            # every restored container stays broken until redeploy. Raise so Modal discards
-            # this container and doesn't snapshot a model-less state (mirrors modal_worker).
             print(f"FATAL: Whisper tiny failed to load:\n{traceback.format_exc()}")
             raise RuntimeError(f"Whisper tiny load failed: {type(e).__name__}: {e}")
 
