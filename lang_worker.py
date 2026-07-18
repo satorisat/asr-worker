@@ -93,12 +93,16 @@ image = (
     volumes={CACHE_DIR: volume},
     scaledown_window=2,
     timeout=120,
+    enable_memory_snapshot=True,
 )
 class LangWorker:
 
-    # No memory snapshot: tiny loads in ~0.4s, so a snapshot saves nothing (cold start is
-    # dominated by Modal container spin-up, not the load) — and ct2/faster-whisper native
-    # state doesn't survive restore cleanly (observed exit 139 segfault). Offline-first stays.
+    # Memory snapshot in the whisper-worker form: a plain @modal.enter() runs AFTER restore,
+    # so the snapshot caches only container/import init — the tiny model reloads each cold
+    # start (~0.4s). We deliberately do NOT use snap=True to capture the model in the snapshot:
+    # ct2/faster-whisper state doesn't survive restore (observed exit 139 segfault). Capturing
+    # weights in the snapshot only works on the torch-based GigaAM worker; for ct2 workers the
+    # imports-only form is the ceiling. Mirrors whisper_worker (proven stable). Offline-first stays.
     @modal.enter()
     def load_models(self):
         from faster_whisper import WhisperModel

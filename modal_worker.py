@@ -167,7 +167,6 @@ class ASRWorker:
         os.makedirs(gigaam_cache, exist_ok=True)
 
         print("Loading GigaAM v3 (CPU, snapshot phase)...")
-        t0 = time.monotonic()
         last_err = None
         downloaded_fresh = False
         for attempt in range(1, 6):
@@ -191,7 +190,7 @@ class ASRWorker:
             # returning errors to every request. Raise so Modal kills it and spawns fresh.
             print(f"FATAL: GigaAM failed to load after 5 attempts:\n{traceback.format_exc()}")
             raise RuntimeError(f"GigaAM load failed: {type(last_err).__name__}: {last_err}")
-        print(f"GigaAM loaded (CPU) in {time.monotonic() - t0:.1f}s")
+        print("GigaAM loaded (CPU)")
 
         # If this container was the one that populated the volume, commit so that
         # future cold starts see the cached weights without re-downloading.
@@ -206,7 +205,6 @@ class ASRWorker:
         # every cold start, which broke on the 2026-07-16 HF outage). Online only as a
         # one-time fallback on a genuine cache miss. GPU move happens in move_to_gpu.
         print("Loading pyannote diarization (CPU, offline-first)...")
-        t1 = time.monotonic()
         self.diarize_model = None
         if hf_token:
             try:
@@ -221,7 +219,7 @@ class ASRWorker:
                         )
 
                 self.diarize_model = _load_offline_first(_load_diarize, "pyannote diarization")
-                print(f"Diarization loaded (CPU) in {time.monotonic() - t1:.1f}s")
+                print("Diarization loaded (CPU)")
             except Exception as e:
                 print(f"Warning: diarization failed to load: {e}")
 
@@ -231,7 +229,6 @@ class ASRWorker:
     # GPU. Fast — weights are already in RAM from the snapshot, only the CPU→GPU transfer runs.
     @modal.enter(snap=False)
     def move_to_gpu(self):
-        import time
         import torch
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -240,7 +237,6 @@ class ASRWorker:
             print("No GPU available — models stay on CPU.")
             return
 
-        t0 = time.monotonic()
         if getattr(self, "gigaam_model", None) is not None and hasattr(self.gigaam_model, "to"):
             self.gigaam_model = self.gigaam_model.to(self.device)
         if getattr(self, "diarize_model", None) is not None:
@@ -252,7 +248,7 @@ class ASRWorker:
                 # "diarization unavailable" (diarization_available:false) honestly.
                 print(f"Warning: moving diarization to GPU failed ({e}) — disabling diarization")
                 self.diarize_model = None
-        print(f"Models moved to {self.device} in {time.monotonic() - t0:.1f}s. Worker ready.")
+        print(f"Models moved to {self.device}. Worker ready.")
 
     @modal.method()
     def do_transcribe(self, request: dict) -> dict:
