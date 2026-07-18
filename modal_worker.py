@@ -81,10 +81,12 @@ def _load_offline_first(loader, what: str):
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
-    # torch первым — чтобы torchcodec (dep pyannote 3.3) нашёл правильные CUDA-колёса
+    # torch первым — чтобы torchcodec (dep pyannote 3.3) нашёл правильные CUDA-колёса.
+    # Пин 2.8.0 — как в whisper-воркере (тот же Modal-стек, работает): без пина pip брал
+    # свежий torchaudio 2.9, где удалён AudioMetaData → падал `from pyannote.audio import Pipeline`.
     .pip_install(
-        "torch",
-        "torchaudio",
+        "torch==2.8.0",
+        "torchaudio==2.8.0",
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
