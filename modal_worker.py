@@ -516,7 +516,15 @@ class ASRWorker:
 #
 # Python 3.10 — как у GPU-образа (`add_python="3.10"`), чтобы слой приёма остался на
 # том же интерпретаторе.
-web_image = modal.Image.debian_slim(python_version="3.10").pip_install("fastapi[standard]")
+# Версия запинена: проверена прогоном (пустое тело -> наш 400, с audio_url -> 200,
+# fastapi 0.143.0 / starlette 1.7.0 / pydantic 2.14.1). Прежде HTTP-слой ехал на той
+# версии, что запеклась в давно закешированный CUDA-образ; у нового образа она
+# разрешалась бы заново на каждой сборке, и смена правил разбора тела запроса
+# (у нас это голый `request: dict`) дала бы 422 на каждую отправку при зелёном
+# деплое. Пин — как у остального несущего в репозитории (torch, pyannote).
+web_image = modal.Image.debian_slim(python_version="3.10").pip_install(
+    "fastapi[standard]==0.143.0"
+)
 
 
 @app.function(
