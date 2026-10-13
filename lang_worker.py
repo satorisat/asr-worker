@@ -91,7 +91,11 @@ image = (
     image=image,
     secrets=[modal.Secret.from_name("worker-auth-token")],
     volumes={CACHE_DIR: volume},
-    scaledown_window=2,
+    # 300с, а не 2: воркер на CPU, и при двух секундах он гас сразу после ответа, то
+    # есть каждое определение языка платило холодным стартом. Именно этот воркер
+    # 12.10.2026 дважды не ответил в бюджет 180с. Простой CPU-контейнера с запросом по
+    # умолчанию — центы в месяц. По доке диапазон 2с…20мин, по умолчанию 60с.
+    scaledown_window=300,
     timeout=120,
     enable_memory_snapshot=True,
 )
