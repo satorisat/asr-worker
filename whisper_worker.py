@@ -437,8 +437,28 @@ class WhisperWorker:
 # FastAPI app — submit / poll pattern
 # ---------------------------------------------------------------------------
 
+# Отдельный ЛЁГКИЙ образ для HTTP-слоя ниже. Он только принимает задание, вызывает
+# `spawn` и отдаёт результат — внутри `web()` используются лишь `os`, `modal` и
+# `fastapi`, ничего из тяжёлого стека. Прежде слой приёма поднимался из того же
+# образа, что GPU-класс: база `nvidia/cuda:12.1.1-cudnn8-runtime` плюс torch,
+# torchaudio, pyannote, speechbrain. Отсюда баннер CUDA в логе ВЕБ-функции
+# (видно 12.10.2026) и лишние секунды на каждый подъём слоя приёма.
+#
+# Дока Modal про веб-эндпоинты требует от образа ровно одного — «your Function uses
+# must have FastAPI installed», и приводит такой же пример:
+# `modal.Image.debian_slim().pip_install("fastapi[standard]")`.
+#
+# GPU-образ НЕ пересобирается: по доке «If the definition hasn't changed since the
+# last time you ran or deployed your App» он берётся из кеша, а его определение мы
+# не трогаем. Собирается только этот новый, маленький.
+#
+# Python 3.10 — как у GPU-образа (`add_python="3.10"`), чтобы слой приёма остался на
+# том же интерпретаторе.
+web_image = modal.Image.debian_slim(python_version="3.10").pip_install("fastapi[standard]")
+
+
 @app.function(
-    image=image,
+    image=web_image,
     # 300с, а не 2: это HTTP-слой (приём задания и отдача результата), а не GPU.
     # Бэкенд опрашивает результат раз в 5 секунд, поэтому при двух секундах контейнер
     # успевал умереть МЕЖДУ опросами и поднимался заново почти на каждый запрос —
