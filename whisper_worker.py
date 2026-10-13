@@ -412,7 +412,15 @@ class WhisperWorker:
 
 @app.function(
     image=image,
-    scaledown_window=2,
+    # 300с, а не 2: это HTTP-слой (приём задания и отдача результата), а не GPU.
+    # Бэкенд опрашивает результат раз в 5 секунд, поэтому при двух секундах контейнер
+    # успевал умереть МЕЖДУ опросами и поднимался заново почти на каждый запрос —
+    # видно в логах Modal 12.10.2026: баннер CUDA в логе именно веб-функции посреди
+    # окна опроса. По доке допустимый диапазон 2с…20мин, значение по умолчанию 60с.
+    # Цена простоя при запросе по умолчанию (0,125 ядра, 128 МиБ) — порядка $0,26 в
+    # месяц на нашем потоке; GPU-классы это не затрагивает, у них окно остаётся 2с,
+    # потому что простой L4 стоит $0,80 в час.
+    scaledown_window=300,
     secrets=[
         modal.Secret.from_name("hf-token"),
         modal.Secret.from_name("worker-auth-token"),
@@ -435,7 +443,11 @@ def web():
 
         try:
             worker = WhisperWorker()
-            fc = worker.do_transcribe.spawn(request)
+            # spawn.aio, а не spawn: эндпоинт асинхронный, и Modal сам предупреждает в
+            # логе («A blocking Modal interface is being used in an async context»,
+            # подсказанная им форма — `await worker.do_transcribe.spawn.aio(request)`).
+            # Дока: «The async interface can be accessed by appending `.aio`».
+            fc = await worker.do_transcribe.spawn.aio(request)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to spawn worker: {e}")
 
