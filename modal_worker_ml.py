@@ -218,7 +218,6 @@ class ASRWorkerML:
     # CPU→GPU move happens in move_to_gpu (snap=False) after restore.
     @modal.enter(snap=True)
     def load_models(self):
-        import shutil
         import time
         import torch
         from pyannote.audio import Pipeline
@@ -268,7 +267,10 @@ class ASRWorkerML:
             downloaded_fresh = False
             for attempt in range(1, 6):
                 try:
-                    had_files_before = bool(os.listdir(gigaam_cache))
+                    # Пробуем СВОЙ файл, а не каталог: он общий с русским воркером, там
+                    # всегда лежат его веса, и проба по каталогу делала бы
+                    # volume.commit() ниже мёртвым кодом.
+                    had_files_before = os.path.exists(os.path.join(gigaam_cache, f"{MODEL_NAME}.ckpt"))
                     # CPU load only — no .to(cuda) here (GPU unavailable in the snapshot phase).
                     self.gigaam_model = gigaam.load_model(MODEL_NAME, download_root=gigaam_cache)
                     if not had_files_before:
