@@ -1,24 +1,29 @@
 """
-Modal Serverless Worker — многоязычная транскрибация (казахский, киргизский, узбекский)
+Modal Serverless Worker — многоязычная транскрибация: казахский, киргизский, узбекский
 GigaAM multilingual_large_ctc + pyannote speaker diarization
 
-Копия modal_worker.py с одной заменой: модель `multilingual_large_ctc` вместо
-`v3_e2e_rnnt`. У этой модели CTC-голова и посимвольный словарь, языкового параметра
-нет — один и тот же код пишет казахский и киргизский кириллицей, узбекский латиницей.
-Какой язык отправлять в этот воркер, решает бэкенд; поле `language` из запроса
-возвращается в ответе как есть.
+Копия modal_worker.py: та же структура, тот же образ, та же фаза снимка, тот же
+HTTP-слой. Меняется модель — `multilingual_large_ctc` вместо `v3_e2e_rnnt`. У неё
+CTC-голова и посимвольный словарь, языкового параметра нет: один и тот же код пишет
+казахский и киргизский кириллицей, узбекский латиницей. Какой язык сюда отправлять,
+решает бэкенд; поле `language` из запроса возвращается в ответе как есть. Пунктуации и
+заглавных эта модель не ставит. Токенизатор для неё не качается — библиотека берёт его
+только для `v1_rnnt` и моделей с `e2e` в имени (проверено по её коду).
 
-ВЕСА КЛАДУТСЯ В ТОМ ЗАРАНЕЕ, воркер их НЕ качает. Причина: библиотека берёт веса с
-CDN Сбера, а у него с 04.11.2026 просрочен сертификат (проверено `openssl s_client`:
-Let's Encrypt YR1, 06.08.2026–04.11.2026, автопродление не сработало). Зеркало
+Парный воркер на Beam — `gigaam_ml_worker.py` в репозитории whisper-beam-fallback.
+
+Веса качает сам воркер в общий том, как сосед. Один нюанс: библиотека берёт их с CDN
+Сбера, а у него с 04.11.2026 просрочен сертификат (проверено openssl s_client: Let's
+Encrypt YR1, 06.08.2026–04.11.2026 — не санкции, а несработавшее автопродление) и
+качает через `urllib.request.urlopen` без своего ssl-контекста. Поэтому на время
+загрузки весов подменяется контекст по умолчанию и возвращается сразу после; pyannote и
+HuggingFace грузятся с полной проверкой. Целостность держит сама библиотека:
+`load_model` делает `assert hash_path(path) == _MODEL_HASHES[name]` при КАЖДОЙ
+загрузке, то есть битый или подменённый чекпоинт роняет контейнер, а не уезжает в
+работу; для подмены нужен прообраз MD5, а не коллизия. Зеркало
 `ai-sage/GigaAM-Multilingual@large_ctc` на HuggingFace не подходит: там плоский словарь
-тензоров (`model.encoder.*`) без ключа `cfg`, а библиотека строит модель из `cfg`
-(проверено скачиванием: md5 c77570645840c876f173ac8e14e71ef9 против нужного
-79a9adde50dd7f35bbf70927cb6557d0, те же 2233 МБ весов, другая упаковка).
-Разовая укладка весов — `provision_ml_weights.py`, там же сверка MD5.
-Подмену закрывает сама библиотека: `load_model` делает
-`assert hash_path(path) == _MODEL_HASHES[name]` при КАЖДОЙ загрузке, то есть битый или
-подложенный файл роняет контейнер, а не уезжает в работу молча.
+тензоров без ключа `cfg` (проверено скачиванием). Когда сертификат продлят, подмену
+можно убрать без других правок.
 
 Deploy:
   pip install modal
@@ -36,18 +41,43 @@ import modal
 
 app = modal.App("asr-worker-ml")
 
-# Отдельный том, а не общий asr-models-cache: прод-воркеры (русский и whisper) его не
-# монтируют, значит укладка 2,2 ГБ весов сюда не может задеть работающие воркеры.
-volume = modal.Volume.from_name("asr-models-cache-ml", create_if_missing=True)
+# Persistent volume for HF model cache — avoids re-downloading on every cold start
+volume = modal.Volume.from_name("asr-models-cache", create_if_missing=True)
 CACHE_DIR = "/vol/hf_cache"
-MODEL_NAME = "multilingual_large_ctc"
+MODEL_NAME = "multilingual_large_ctc"   # kk / ky / uz, CTC-голова
 
+# Логи и кусочный кеш клиента xet — ВНЕ тома.
+#
+# Дока Modal про снапшоты памяти говорит прямо: «Deleting files in a Volume used
+# during restore will cause restore failures». Именно это и происходило. По доке HF
+# `HF_XET_CACHE` по умолчанию равен `$HF_HOME/xet`, то есть ложился в том, и клиент
+# писал туда файлы с меткой времени (`xet/logs/xet_<метка>_N.log`), а старые сам
+# подчищал (в томе 358 логов, самый старый — за две недели). GigaAM снимает снапшот
+# ПОСЛЕ загрузки моделей (`enter(snap=True)`), поэтому ссылка на такой лог попадала в
+# снапшот; когда лог подчищался, восстановление падало намертво и уже не могло
+# подняться до следующего деплоя:
+#   vfs.CompleteRestore() failed ... failed to walk ".../xet/logs/xet_...log"
+#   Runner failed with exit code: 128
+# 12.10 так упало четыре контейнера — все по ссылке на лог от 25.09. Каждое падение
+# стоит лишнего холодного старта. Том общий на три воркера (его может подчистить любой
+# из них), поэтому переменная ставится во всех трёх.
+#
+# На офлайн это НЕ влияет: веса в томе лежат отдельно — `gigaam/` (свой `download_root`
+# у библиотеки GigaAM, см. `gigaam.load_model(..., download_root=…)`) и
+# `whisper/` (download_root у faster-whisper); каталог `xet/` при `HF_HUB_OFFLINE=1`
+# для загрузки весов не нужен вовсе, там оставались только логи и кусочный кеш
+# докачки. Порядок загрузки моделей и сам `HF_HOME` не тронуты.
+#
+# Задаётся на уровне модуля — до импорта huggingface_hub, чтобы значение не зависело
+# от того, читает библиотека переменную при импорте или в момент обращения. Образ не
+# меняется, значит пересборки нет.
 os.environ.setdefault("HF_XET_CACHE", "/tmp/hf_xet")
 
-MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 
 def _validate_url(url: str) -> None:
+    """Raise ValueError if URL is unsafe (SSRF prevention)."""
     import urllib.parse
     import ipaddress
     parsed = urllib.parse.urlparse(url)
@@ -61,7 +91,7 @@ def _validate_url(url: str) -> None:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return
+        return  # domain name — allowed
     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
         raise ValueError(f"Blocked private address: {host}")
 
@@ -80,6 +110,9 @@ def _hf_offline(on: bool):
 
 
 def _load_offline_first(loader, what: str):
+    """Load from the volume HF cache with NO network; on a genuine cache miss (first-ever
+    container / wiped cache) fall back to a one-time online download, then re-assert offline.
+    Keeps a HuggingFace outage from breaking cold starts once the model is cached."""
     _hf_offline(True)
     try:
         return loader()
@@ -92,10 +125,16 @@ def _load_offline_first(loader, what: str):
             _hf_offline(True)
 
 
-# Образ — копия продового, с теми же пинами (урезанный образ = урезанный тест).
+# ---------------------------------------------------------------------------
+# Image — GigaAM + pyannote
+# ---------------------------------------------------------------------------
+
 image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04", add_python="3.10")
     .apt_install("ffmpeg", "git")
+    # torch первым — чтобы torchcodec (dep pyannote 3.3) нашёл правильные CUDA-колёса.
+    # Пин 2.8.0 — как в whisper-воркере (тот же Modal-стек, работает): без пина pip брал
+    # свежий torchaudio 2.9, где удалён AudioMetaData → падал `from pyannote.audio import Pipeline`.
     .pip_install(
         "torch==2.8.0",
         "torchaudio==2.8.0",
@@ -109,11 +148,27 @@ image = (
         "matplotlib",
         "scipy",
         "sentencepiece",
-        "pyannote.audio==3.3.2",
+        "pyannote.audio==3.3.2",  # 3.3.2 = последний 3.x: numpy 2.x safe, без torchcodec
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
+    # Кеш pyannote и huggingface_hub — в том, а не в контейнер.
+    # Почему на уровне образа, а не в рантайме: pyannote читает
+    # CACHE_DIR = os.getenv("PYANNOTE_CACHE", "~/.cache/torch/pyannote") на уровне модуля,
+    # а huggingface_hub вычисляет HF_HOME/HF_HUB_CACHE при импорте. Присваивание
+    # os.environ[...] в load_models происходит ПОСЛЕ импортов, то есть для них уже поздно —
+    # поэтому веса pyannote до сих пор качались заново на каждом холодном старте
+    # (авария 16.07.2026, когда HuggingFace был недоступен).
+    # Слой последний → pip_install берётся из кеша, незапиненный GigaAM не перекачивается
+    # (проверено прогоном: собрался только слой ENV).
+    # HF_XET_CACHE здесь ОБЯЗАТЕЛЕН: как только HF_HOME указывает в том, путь кеша xet по
+    # умолчанию становится $HF_HOME/xet — ровно тот каталог, из-за которого 12.10 ломалось
+    # восстановление снимка. Без этой строки защита держится на одном setdefault и порядке
+    # импортов.
+    # volume.commit() сознательно НЕ добавлен: Modal фиксирует том в фоне и при остановке
+    # контейнера, а явный коммит в фазе snap=True — это та самая запись в том, на которой
+    # ломалось восстановление.
     .env({
         "HF_HOME": CACHE_DIR,
         "PYANNOTE_CACHE": CACHE_DIR + "/pyannote",
@@ -123,12 +178,28 @@ image = (
 
 
 # ---------------------------------------------------------------------------
-# Воркер — копия продового класса, другая модель
+# Worker class
 # ---------------------------------------------------------------------------
 
 @app.cls(
-    # Тот же список карт и тот же порядок, что у русского воркера: Modal берёт первую
-    # СВОБОДНУЮ и порядок соблюдает. Обоснование — в modal_worker.py.
+    # Список карт, а не одна: Modal берёт первую СВОБОДНУЮ, порядок соблюдает
+    # («Modal allows specifying a list of possible GPU types… respects the ordering»).
+    # Зачем: 21.10.2026 за 12 часов 83 задания, работа p50 15с, а полное время p50 233с
+    # и p90 1057с — при бюджете опроса 900с это значит, что каждое десятое задание
+    # обязано провалиться на резерв. Залипаний сети при этом НОЛЬ (все события
+    # `wedged_attempts=0`), контейнер поднимается за 4,4с, лимитов у нас не задано,
+    # план Starter даёт «100 containers + 10 GPU concurrency» — то есть упираемся не в
+    # себя и не в сеть, а в отсутствие свободной карты ЗАПРОШЕННОГО типа.
+    #
+    # Цена: за задание в 15с L4 $0,0033, A10 $0,0046, L40S $0,0081, A100 $0,0087,
+    # H100 $0,0165 — но дорогие берутся только когда дешёвых нет, а H100 ту же работу
+    # делает быстрее, поэтому разница на деле меньше часовой ставки. Дороже на цент
+    # против 15 минут ожидания и второго прогона на Beam — обмен выгодный.
+    #
+    # T4 намеренно НЕ включён (решение юзера 21.10): он втрое медленнее на fp32, и
+    # 45с × 0,000164 ≈ $0,0074 за задание, то есть как L40S, только медленно.
+    # По памяти подходят все: модель ~1 млрд параметров + pyannote, это единицы ГБ.
+    # По точности тоже: bf16 нигде нет (у Whisper float16, у GigaAM fp32).
     gpu=["L4", "A10", "L40S", "A100", "H100"],
     image=image,
     secrets=[
@@ -142,22 +213,29 @@ image = (
 )
 class ASRWorkerML:
 
+    # snap=True: runs BEFORE the memory snapshot. GPU is NOT available in this phase, so we
+    # load GigaAM and pyannote on CPU — that loaded state is captured in the snapshot. The
+    # CPU→GPU move happens in move_to_gpu (snap=False) after restore.
     @modal.enter(snap=True)
     def load_models(self):
+        import shutil
         import time
         import torch
         from pyannote.audio import Pipeline
         import gigaam
 
         self._load_error = None
-        self.device = "cpu"
+        self.device = "cpu"  # real device is set in move_to_gpu (GPU unavailable during snapshot)
 
         os.environ["HF_HOME"] = CACHE_DIR
         _hf_offline(True)
+        # GigaAM хранит веса в torch.hub dir — направляем в volume
         torch.hub.set_dir(CACHE_DIR)
 
         hf_token = os.environ.get("HF_TOKEN", "")
 
+        # Patch GigaAM vad_utils: passes local snapshot path to Model.from_pretrained()
+        # but pyannote 3.3.2 expects a HF repo ID. Override to pass repo ID directly.
         import gigaam.vad_utils as _vad
         def _patched_load_segmentation_model(model_id):
             from pyannote.audio import Model
@@ -166,46 +244,75 @@ class ASRWorkerML:
             def _load():
                 with torch.serialization.safe_globals([TorchVersion, Problem, Specifications, Resolution]):
                     return Model.from_pretrained(model_id, use_auth_token=os.environ.get("HF_TOKEN"))
+            # Called lazily by transcribe_longform's VAD (post-restore, offline). Route through
+            # offline-first so it self-heals on a cold cache instead of hard-failing offline.
             return _load_offline_first(_load, f"VAD segmentation ({model_id})")
         _vad.load_segmentation_model = _patched_load_segmentation_model
 
+        # Download GigaAM weights into the persistent Modal Volume (Modal-recommended
+        # pattern for model weights, mirrors what Whisper already does). First successful
+        # container skills the volume; all subsequent cold starts read from volume with no
+        # network. On corrupt/partial file we wipe the cached path and retry with backoff.
         gigaam_cache = os.path.join(CACHE_DIR, "gigaam")
         os.makedirs(gigaam_cache, exist_ok=True)
 
         print(f"Loading GigaAM {MODEL_NAME} (CPU, snapshot phase)...")
-        last_err = None
-        last_tb = None
-        for attempt in range(1, 6):
-            try:
-                self.gigaam_model = gigaam.load_model(MODEL_NAME, download_root=gigaam_cache)
-                break
-            except Exception as e:
-                # Первую ошибку и её трассировку не теряем: после повторов они важнее
-                # последней. traceback.format_exc() ниже, в ветке else у for, вернул бы
-                # "NoneType: None" — там уже нет активного обработчика (проверено).
-                if last_err is None:
+        # Проверка сертификата CDN снимается ТОЛЬКО на загрузку весов и
+        # возвращается в finally — причина в шапке файла. Цикл повторов, его else и
+        # volume.commit() ниже оставлены как в modal_worker.py.
+        import ssl
+        _prev_ssl_context = ssl._create_default_https_context
+        ssl._create_default_https_context = ssl._create_unverified_context
+        try:
+            last_err = None
+            downloaded_fresh = False
+            for attempt in range(1, 6):
+                try:
+                    had_files_before = bool(os.listdir(gigaam_cache))
+                    # CPU load only — no .to(cuda) here (GPU unavailable in the snapshot phase).
+                    self.gigaam_model = gigaam.load_model(MODEL_NAME, download_root=gigaam_cache)
+                    if not had_files_before:
+                        downloaded_fresh = True
+                    break
+                except Exception as e:
                     last_err = e
-                    last_tb = traceback.format_exc()
-                print(f"GigaAM load attempt {attempt}/5 failed: {type(e).__name__}: {e}")
-                # Каталог НЕ чистим, в отличие от modal_worker.py. Там чистка — это
-                # ремонт: стёрли недокачанный файл, скачали заново. Здесь скачать
-                # заново НЕЛЬЗЯ (сертификат CDN просрочен, зеркало в другом формате —
-                # см. шапку), поэтому стирание 2,2 ГБ превратило бы один сбой в
-                # постоянную поломку воркера до ручной переукладки весов. Повтор без
-                # стирания по-прежнему лечит разовое: нехватку памяти на проверке MD5
-                # (библиотека читает чекпоинт в память целиком) и срыв чтения тома.
-                if attempt < 5:
-                    time.sleep(min(2 ** attempt, 30))
-        else:
-            print(f"FATAL: GigaAM failed to load after 5 attempts:\n{last_tb}")
-            raise RuntimeError(f"GigaAM load failed: {type(last_err).__name__}: {last_err}")
+                    print(f"GigaAM load attempt {attempt}/5 failed: {type(e).__name__}: {e}")
+                    # Чистим ТОЛЬКО свой чекпоинт, а не каталог целиком, как в
+                    # modal_worker.py: том общий, download_root у обоих воркеров один и тот
+                    # же, а у русского воркера обхода просроченного сертификата CDN нет —
+                    # rmtree каталога снёс бы его веса без возможности их скачать. Смысл
+                    # чистки сохранён: недокачанный или битый файл этой модели убирается.
+                    ckpt = os.path.join(gigaam_cache, f"{MODEL_NAME}.ckpt")
+                    if os.path.exists(ckpt):
+                        try:
+                            os.unlink(ckpt)
+                            print(f"removed {ckpt} before retry")
+                        except OSError as exc:
+                            print(f"could not remove {ckpt}: {exc}")
+                    os.makedirs(gigaam_cache, exist_ok=True)
+                    if attempt < 5:
+                        time.sleep(min(2 ** attempt, 30))
+            else:
+                # Don't swallow into _load_error: that keeps the broken container alive
+                # returning errors to every request. Raise so Modal kills it and spawns fresh.
+                print(f"FATAL: GigaAM failed to load after 5 attempts:\n{traceback.format_exc()}")
+                raise RuntimeError(f"GigaAM load failed: {type(last_err).__name__}: {last_err}")
+        finally:
+            ssl._create_default_https_context = _prev_ssl_context
         print("GigaAM loaded (CPU)")
 
-        # volume.commit() из modal_worker.py здесь НЕ нужен: веса кладутся заранее,
-        # воркер в этот каталог не пишет. Заодно убран и риск — явная запись в том
-        # внутри @modal.enter(snap=True) это то, на чём ломалось восстановление
-        # снимка 12.10 (см. modal_worker.py).
+        # If this container was the one that populated the volume, commit so that
+        # future cold starts see the cached weights without re-downloading.
+        if downloaded_fresh:
+            try:
+                volume.commit()
+                print("GigaAM weights committed to volume")
+            except Exception as e:
+                print(f"Warning: volume.commit() failed: {e}")
 
+        # pyannote on CPU, offline-first from the volume cache (was HF_HUB_OFFLINE=0 → online
+        # every cold start, which broke on the 2026-07-16 HF outage). Online only as a
+        # one-time fallback on a genuine cache miss. GPU move happens in move_to_gpu.
         print("Loading pyannote diarization (CPU, offline-first)...")
         self.diarize_model = None
         if hf_token:
@@ -227,6 +334,8 @@ class ASRWorkerML:
 
         print("Snapshot-phase load complete (models on CPU).")
 
+    # snap=False: runs AFTER snapshot restore (GPU available). Move the CPU-loaded models to
+    # GPU. Fast — weights are already in RAM from the snapshot, only the CPU→GPU transfer runs.
     @modal.enter(snap=False)
     def move_to_gpu(self):
         import torch
@@ -243,6 +352,9 @@ class ASRWorkerML:
             try:
                 self.diarize_model = self.diarize_model.to(torch.device(self.device))
             except Exception as e:
+                # Don't leave it on CPU silently — diarization would then run at CPU speed on
+                # a GPU request path and risk a timeout. Disable it so behavior matches
+                # "diarization unavailable" (diarization_available:false) honestly.
                 print(f"Warning: moving diarization to GPU failed ({e}) — disabling diarization")
                 self.diarize_model = None
         print(f"Models moved to {self.device}. Worker ready.")
@@ -333,6 +445,7 @@ class ASRWorkerML:
     def _run_gigaam(self, audio_path, enable_diarization, min_speakers, max_speakers):
         import concurrent.futures
 
+        # Конвертируем один раз — используется и GigaAM, и pyannote
         wav_path = audio_path + ".wav"
         conv = subprocess.run(
             ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
@@ -371,6 +484,10 @@ class ASRWorkerML:
     def _transcribe(self, input_path):
         print("Running GigaAM transcribe_longform...")
         result = self.gigaam_model.transcribe_longform(input_path)
+        # GigaAM changed transcribe_longform's return type across versions: newer releases
+        # return a LongformTranscriptionResult of Segment dataclasses (.text/.start/.end);
+        # older ones returned dicts ({"transcription","boundaries"}). Support both so a
+        # GigaAM version bump doesn't break us (mirrors the Beam gigaam worker).
         utterances = getattr(result, "segments", result)
         segments = []
         for utt in utterances:
@@ -381,7 +498,7 @@ class ASRWorkerML:
                 text = (getattr(utt, "text", "") or "").strip()
                 start, end = utt.start, utt.end
             if text:
-                segments.append({"start": float(start), "end": float(end), "text": str(text)})
+                segments.append({"start": float(start), "end": float(end), "text": text})
         print(f"GigaAM transcribed {len(segments)} segments")
         return segments
 
@@ -421,6 +538,7 @@ class ASRWorkerML:
                     best_speaker = turn["speaker"]
             seg["speaker"] = best_speaker
 
+        # Renumber speakers by order of first appearance: SPEAKER_04 → SPEAKER_00, etc.
         speaker_order = {}
         for seg in segments:
             sp = seg.get("speaker")
@@ -461,11 +579,36 @@ class ASRWorkerML:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app — submit / poll pattern (как в modal_worker.py)
+# FastAPI app — submit / poll pattern
 # ---------------------------------------------------------------------------
 
-# Отдельный лёгкий образ для HTTP-слоя: он только принимает задание, вызывает spawn и
-# отдаёт результат. Обоснование и пин версии — в modal_worker.py, здесь то же самое.
+# Отдельный ЛЁГКИЙ образ для HTTP-слоя ниже. Он только принимает задание, вызывает
+# `spawn` и отдаёт результат — внутри `web()` используются лишь `os`, `modal` и
+# `fastapi`, ничего из тяжёлого стека. Прежде слой приёма поднимался из того же
+# образа, что GPU-класс: база `nvidia/cuda:12.1.1-cudnn8-runtime` плюс torch,
+# torchaudio, pyannote, speechbrain. Отсюда баннер CUDA в логе ВЕБ-функции
+# (видно 12.10.2026) и лишние секунды на каждый подъём слоя приёма.
+#
+# У нас `@modal.asgi_app()`, и для него дока Modal состава образа не диктует — ASGI-
+# приложение может быть любым, fastapi нужен просто потому, что его импортирует наш
+# код. Требование «the Image your Function uses must have FastAPI installed» стоит в
+# доке у соседнего `@modal.fastapi_endpoint`; пример там приведён ровно такой же:
+# `modal.Image.debian_slim().pip_install("fastapi[standard]")`.
+#
+# GPU-образ НЕ пересобирается: по доке «If the definition hasn't changed since the
+# last time you ran or deployed your App» он берётся из кеша, а его определение мы
+# не трогаем. Собирается только этот новый, маленький.
+#
+# Python 3.10 — та же минорная серия, что у GPU-образа (`add_python="3.10"`). Именно
+# серия, а не тот же сборочный вариант: `add_python` ставит python-build-standalone, а
+# `debian_slim` — официальный `python:3.10-slim`. На передачу данных это не влияет:
+# через `spawn` уходит плоский dict и такой же возвращается.
+# Версия запинена: проверена прогоном (пустое тело -> наш 400, с audio_url -> 200,
+# fastapi 0.143.0 / starlette 1.7.0 / pydantic 2.14.1). Прежде HTTP-слой ехал на той
+# версии, что запеклась в давно закешированный CUDA-образ; у нового образа она
+# разрешалась бы заново на каждой сборке, и смена правил разбора тела запроса
+# (у нас это голый `request: dict`) дала бы 422 на каждую отправку при зелёном
+# деплое. Пин — как у остального несущего в репозитории (torch, pyannote).
 web_image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "fastapi[standard]==0.143.0"
 )
@@ -473,8 +616,14 @@ web_image = modal.Image.debian_slim(python_version="3.10").pip_install(
 
 @app.function(
     image=web_image,
-    # 300с, а не 2: бэкенд опрашивает результат раз в 5 секунд, при двух секундах
-    # контейнер успевал умереть между опросами. Подробности — в modal_worker.py.
+    # 300с, а не 2: это HTTP-слой (приём задания и отдача результата), а не GPU.
+    # Бэкенд опрашивает результат раз в 5 секунд, поэтому при двух секундах контейнер
+    # успевал умереть МЕЖДУ опросами и поднимался заново почти на каждый запрос —
+    # видно в логах Modal 12.10.2026: баннер CUDA в логе именно веб-функции посреди
+    # окна опроса. По доке допустимый диапазон 2с…20мин, значение по умолчанию 60с.
+    # Цена простоя при запросе по умолчанию (0,125 ядра, 128 МиБ) — порядка $0,26 в
+    # месяц на нашем потоке; GPU-классы это не затрагивает, у них окно остаётся 2с,
+    # потому что простой L4 стоит $0,80 в час.
     scaledown_window=300,
     secrets=[
         modal.Secret.from_name("hf-token"),
@@ -498,6 +647,10 @@ def web():
 
         try:
             worker = ASRWorkerML()
+            # spawn.aio, а не spawn: эндпоинт асинхронный, и Modal сам предупреждает в
+            # логе («A blocking Modal interface is being used in an async context»,
+            # подсказанная им форма — `await worker.do_transcribe.spawn.aio(request)`).
+            # Дока: «The async interface can be accessed by appending `.aio`».
             fc = await worker.do_transcribe.spawn.aio(request)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to spawn worker: {e}")
