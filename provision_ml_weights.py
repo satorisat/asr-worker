@@ -87,13 +87,28 @@ def provision(insecure: bool = False, check_only: bool = False) -> dict:
         out["md5"] = _md5_file(final)
         out["md5_ok"] = out["md5"] == want
         out["bytes"] = os.path.getsize(final)
-        print("веса на месте:", json.dumps(out, ensure_ascii=False))
+        if not out["md5_ok"]:
+            # Выходить с нулём тут нельзя: это шаг перед деплоем, и «веса на месте»
+            # при битом файле означало бы зелёный свет на деплой воркера, который
+            # потом падает на проверке MD5 внутри библиотеки при каждом старте.
+            print("ВЕСА НА МЕСТЕ, НО БИТЫЕ:", json.dumps(out, ensure_ascii=False))
+            raise RuntimeError(
+                f"MD5 не совпал у {final}: {out['md5']} != {want}. "
+                f"Удалить файл осознанно и уложить заново."
+            )
+        print("веса на месте и целые:", json.dumps(out, ensure_ascii=False))
         return out
 
     out["present"] = False
+    stale = final + ".part"
+    if os.path.exists(stale):
+        # Жёсткое убийство контейнера (OOM, вытеснение, таймаут) обработчик не
+        # выполняет, поэтому огрызок переживает прогон. Валидными весами его никто не
+        # примет (имя другое), но место он занимает — сообщаем.
+        out["stale_part_bytes"] = os.path.getsize(stale)
     if check_only:
         print("весов нет:", json.dumps(out, ensure_ascii=False))
-        return out
+        raise RuntimeError(f"весов нет: {final} — запустить без --check, чтобы уложить")
 
     url = f"https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM/{MODEL_NAME}.ckpt"
     ctx = None
@@ -131,8 +146,13 @@ def provision(insecure: bool = False, check_only: bool = False) -> dict:
     out["md5_ok"] = out["md5"] == want
 
     if not out["md5_ok"]:
-        os.unlink(tmp)
-        print("MD5 НЕ СОВПАЛ, файл удалён:", json.dumps(out, ensure_ascii=False))
+        # Сначала печатаем диагноз, потом удаляем: ошибка самого удаления не должна
+        # подменить сообщение о несовпадении MD5.
+        print("MD5 НЕ СОВПАЛ, файл удаляется:", json.dumps(out, ensure_ascii=False))
+        try:
+            os.unlink(tmp)
+        except OSError as exc:
+            print(f"не удалось удалить {tmp}: {exc}")
         raise RuntimeError(f"MD5 mismatch: {out['md5']} != {want}")
 
     os.rename(tmp, final)

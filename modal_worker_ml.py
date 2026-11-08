@@ -144,7 +144,6 @@ class ASRWorkerML:
 
     @modal.enter(snap=True)
     def load_models(self):
-        import shutil
         import time
         import torch
         from pyannote.audio import Pipeline
@@ -175,32 +174,37 @@ class ASRWorkerML:
 
         print(f"Loading GigaAM {MODEL_NAME} (CPU, snapshot phase)...")
         last_err = None
-        downloaded_fresh = False
+        last_tb = None
         for attempt in range(1, 6):
             try:
-                had_files_before = bool(os.listdir(gigaam_cache))
                 self.gigaam_model = gigaam.load_model(MODEL_NAME, download_root=gigaam_cache)
-                if not had_files_before:
-                    downloaded_fresh = True
                 break
             except Exception as e:
-                last_err = e
+                # Первую ошибку и её трассировку не теряем: после повторов они важнее
+                # последней. traceback.format_exc() ниже, в ветке else у for, вернул бы
+                # "NoneType: None" — там уже нет активного обработчика (проверено).
+                if last_err is None:
+                    last_err = e
+                    last_tb = traceback.format_exc()
                 print(f"GigaAM load attempt {attempt}/5 failed: {type(e).__name__}: {e}")
-                shutil.rmtree(gigaam_cache, ignore_errors=True)
-                os.makedirs(gigaam_cache, exist_ok=True)
+                # Каталог НЕ чистим, в отличие от modal_worker.py. Там чистка — это
+                # ремонт: стёрли недокачанный файл, скачали заново. Здесь скачать
+                # заново НЕЛЬЗЯ (сертификат CDN просрочен, зеркало в другом формате —
+                # см. шапку), поэтому стирание 2,2 ГБ превратило бы один сбой в
+                # постоянную поломку воркера до ручной переукладки весов. Повтор без
+                # стирания по-прежнему лечит разовое: нехватку памяти на проверке MD5
+                # (библиотека читает чекпоинт в память целиком) и срыв чтения тома.
                 if attempt < 5:
                     time.sleep(min(2 ** attempt, 30))
         else:
-            print(f"FATAL: GigaAM failed to load after 5 attempts:\n{traceback.format_exc()}")
+            print(f"FATAL: GigaAM failed to load after 5 attempts:\n{last_tb}")
             raise RuntimeError(f"GigaAM load failed: {type(last_err).__name__}: {last_err}")
         print("GigaAM loaded (CPU)")
 
-        if downloaded_fresh:
-            try:
-                volume.commit()
-                print("GigaAM weights committed to volume")
-            except Exception as e:
-                print(f"Warning: volume.commit() failed: {e}")
+        # volume.commit() из modal_worker.py здесь НЕ нужен: веса кладутся заранее,
+        # воркер в этот каталог не пишет. Заодно убран и риск — явная запись в том
+        # внутри @modal.enter(snap=True) это то, на чём ломалось восстановление
+        # снимка 12.10 (см. modal_worker.py).
 
         print("Loading pyannote diarization (CPU, offline-first)...")
         self.diarize_model = None
