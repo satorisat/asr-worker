@@ -77,6 +77,14 @@ MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 
 PUNCT_REPO = "Horizon-Labs/punctuation-restoration-small"
+# Пин ревизии: репозиторий живой (последнее изменение 04.11.2026), а метки мы читаем из
+# его config.json. Переименуют пустую метку «0» в «O» — и условие lab != "0" станет
+# верным для КАЖДОГО токена, то есть знак влезет после каждого слова, причём в логе это
+# будет выглядеть самым здоровым образом («знаков поставлено: все»).
+PUNCT_REVISION = "12b02a85b60a2843ad6f22e4248669f50aeecdbb"
+# Набор меток этой ревизии. Проверяем после загрузки: если он изменился, пунктуацию
+# выключаем, а не вставляем в текст неизвестные строки.
+PUNCT_LABELS = {"0", ".", ",", "?", "-", ":"}
 # Окно 400 токенов с перехлёстом 50 — как в эталонном punctuate.py автора модели.
 # Проверено прогоном на 3000 слов: при окне 2048 знаков меньше (263 против 318) и точки
 # на концах предложений теряются, расхождение между окнами 44%. Выигрыш по времени
@@ -87,22 +95,25 @@ PUNCT_CHUNK, PUNCT_OVERLAP = 400, 50
 def _load_punct(device):
     """Модель расстановки знаков. Грузится ВМЕСТЕ с остальными, в фазе снимка
     (@modal.enter(snap=True)), поэтому её 7-8с попадают в снимок памяти и на запросы не
-    влияют вовсе — к концу расшифровки модель уже готова. Сам проход по тексту — 1,4с
-    на час речи на A10.
+    влияют вовсе. Сам проход по тексту — 1,4с на час речи на A10.
 
     Возвращает (модель, токенизатор). Исключения НЕ глотает — их гасит вызывающий,
     чтобы обёртка offline-first могла сделать повторную попытку."""
     import torch
     from transformers import AutoModelForTokenClassification, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(PUNCT_REPO)
+    tok = AutoTokenizer.from_pretrained(PUNCT_REPO, revision=PUNCT_REVISION)
     # reference_compile=False обязателен: иначе transformers зовёт torch.compile, а в
     # образе нет компилятора C — падает с «Failed to find C compiler» (проверено).
     model = AutoModelForTokenClassification.from_pretrained(
         PUNCT_REPO,
+        revision=PUNCT_REVISION,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         reference_compile=False,
     ).eval().to(device)
+    labels = set(model.config.id2label.values())
+    if not labels <= PUNCT_LABELS:
+        raise RuntimeError(f"unexpected punctuation labels {sorted(labels)}, expected subset of {sorted(PUNCT_LABELS)}")
     print(f"Punctuation model loaded ({PUNCT_REPO}, {device})")
     return model, tok
 
@@ -461,10 +472,26 @@ class ASRWorkerML:
                 # "diarization unavailable" (diarization_available:false) honestly.
                 print(f"Warning: moving diarization to GPU failed ({e}) — disabling diarization")
                 self.diarize_model = None
-        if getattr(self, "punct", None) is not None:
+        # Если в снимок попал None (одна неудачная загрузка в фазе снимка), то без этого
+        # повтора пунктуация была бы выключена у ВСЕХ восстановленных контейнеров до
+        # следующего деплоя. После восстановления есть и сеть, и карта — пробуем снова.
+        if getattr(self, "punct", None) is None:
+            print("Punctuation model missing after restore — retrying load")
+            try:
+                self.punct = _load_offline_first(lambda: _load_punct(self.device), "punctuation model")
+            except Exception as e:
+                print(f"Warning: punctuation retry failed: {type(e).__name__}: {e}")
+                self.punct = None
+        else:
             try:
                 model, tok = self.punct
-                self.punct = (model.to(self.device).half(), tok)
+                moved = model.to(self.device, dtype=torch.float16)
+                # Проверяем, что перенос дошёл до конца: .to() меняет модуль на месте
+                # параметр за параметром, и сбой на середине оставил бы часть на
+                # процессоре. Публикуем только проверенное.
+                if len({p.device.type for p in moved.parameters()}) != 1:
+                    raise RuntimeError("punctuation model left half-moved between devices")
+                self.punct = (moved, tok)
             except Exception as e:
                 # Отключаем, а НЕ «оставляем на процессоре»: .to() и .half() меняют модуль
                 # на месте, поэтому после сбоя на середине он остаётся полуперенесённым,
