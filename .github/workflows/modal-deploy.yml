@@ -23,3 +23,4 @@ jobs:
           modal deploy modal_worker.py
           modal deploy lang_worker.py
           modal deploy whisper_worker.py
+          modal deploy modal_worker_ml.py
