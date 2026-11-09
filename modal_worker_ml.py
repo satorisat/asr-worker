@@ -76,6 +76,83 @@ os.environ.setdefault("HF_XET_CACHE", "/tmp/hf_xet")
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 
+PUNCT_REPO = "Horizon-Labs/punctuation-restoration-small"
+# Окно 400 токенов с перехлёстом 50 — как в эталонном punctuate.py автора модели.
+# Проверено прогоном на 3000 слов: при окне 2048 знаков меньше (263 против 318) и точки
+# на концах предложений теряются, расхождение между окнами 44%. Выигрыш по времени
+# (0,19с против 0,93с на 3000 слов) того не стоит.
+PUNCT_CHUNK, PUNCT_OVERLAP = 400, 50
+
+
+def _load_punct(device):
+    """Модель расстановки знаков. Грузится ВМЕСТЕ с остальными, в on_start: тогда к
+    моменту, когда расшифровка готова, модель уже в памяти, и запрос платит только за
+    сам проход (1,4с на час речи на A10). Загрузка стоит 7-8с и при загрузке по
+    требованию ложилась бы на первый файл после каждого холодного старта.
+
+    Возвращает (модель, токенизатор) или None — отказ пунктуации не должен мешать
+    расшифровке."""
+    try:
+        import torch
+        from transformers import AutoModelForTokenClassification, AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(PUNCT_REPO)
+        # reference_compile=False обязателен: иначе transformers зовёт torch.compile, а в
+        # образе нет компилятора C — падает с «Failed to find C compiler» (проверено).
+        model = AutoModelForTokenClassification.from_pretrained(
+            PUNCT_REPO,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            reference_compile=False,
+        ).eval().to(device)
+        print(f"Punctuation model loaded ({PUNCT_REPO}, {device})")
+        return model, tok
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: punctuation model failed to load: {type(e).__name__}: {e}")
+        return None
+
+
+def _punctuate(punct, text: str) -> str:
+    """Расставить знаки в тексте одного сегмента. Слова не меняются и не добавляются:
+    модель только помечает, после какого слова ставить знак (классификация токенов).
+    Регистр не трогаем — у этой модели в наборе метки только знаки."""
+    import torch
+
+    model, tok = punct
+    # truncation=False обязателен: в tokenizer.json включена обрезка на 512 токенов, с
+    # ней длинный текст молча остаётся без знаков после первых ~350 слов (проверено).
+    enc = tok(text, return_offsets_mapping=True, add_special_tokens=False, truncation=False)
+    ids, offs = enc["input_ids"], enc["offset_mapping"]
+    if not ids:
+        return text
+    # ключи id2label у transformers ЦЕЛЫЕ (в config.json строки) — приводим.
+    id2label = {int(k): v for k, v in model.config.id2label.items()}
+    device = next(model.parameters()).device
+    marks, start = {}, 0
+    with torch.no_grad():
+        while start < len(ids):
+            end = min(len(ids), start + PUNCT_CHUNK)
+            x = torch.tensor([[tok.cls_token_id] + ids[start:end] + [tok.sep_token_id]], device=device)
+            pred = model(input_ids=x).logits[0, 1:-1].argmax(-1).tolist()
+            keep_to = end if end == len(ids) else end - PUNCT_OVERLAP
+            for k in range(start, keep_to):
+                s_off, e_off = offs[k]
+                if e_off > s_off:
+                    lab = id2label[pred[k - start]]
+                    if lab != "0":
+                        marks[e_off] = lab
+            if end == len(ids):
+                break
+            start = keep_to
+    # знак ставим только на границе слова, чтобы не разорвать слово
+    res, prev = [], 0
+    for e in sorted(marks):
+        if not (e == len(text) or text[e] == " "):
+            continue
+        res.append(text[prev:e] + marks[e])
+        prev = e
+    return "".join(res) + text[prev:]
+
+
 def _validate_url(url: str) -> None:
     """Raise ValueError if URL is unsafe (SSRF prevention)."""
     import urllib.parse
@@ -151,6 +228,11 @@ image = (
         "pyannote.audio==3.3.2",  # 3.3.2 = последний 3.x: numpy 2.x safe, без torchcodec
         "speechbrain>=1.0.0",
         "scikit-learn>=1.3.0",
+        # transformers нужен ТОЛЬКО для модели пунктуации (ModernBERT): архитектура
+        # появилась в 4.48, на более старых загрузка падает с «does not recognize this
+        # architecture» (проверено прогоном на 4.46.3). Pyannote его не тянет — он нужен
+        # ему лишь для необязательного набора separation, который мы не ставим.
+        "transformers==4.49.0",
         "git+https://github.com/salute-developers/GigaAM.git",
     )
     # Кеш pyannote и huggingface_hub — в том, а не в контейнер.
@@ -334,6 +416,14 @@ class ASRWorkerML:
             except Exception as e:
                 print(f"Warning: diarization failed to load: {e}")
 
+        # Пунктуация: эта линия GigaAM знаков не ставит (посимвольная CTC-голова),
+        # поэтому ставим их отдельной моделью. Грузим ЗДЕСЬ же, в фазе снимка, на
+        # процессоре — карты в этой фазе нет; перенос на карту идёт в move_to_gpu
+        # вместе с остальными моделями. Так загрузка (7-8с) попадает в снимок памяти и
+        # на запросы не влияет: к концу расшифровки модель уже готова.
+        print("Loading punctuation model (CPU, snapshot phase)...")
+        self.punct = _load_punct("cpu")
+
         print("Snapshot-phase load complete (models on CPU).")
 
     # snap=False: runs AFTER snapshot restore (GPU available). Move the CPU-loaded models to
@@ -359,6 +449,15 @@ class ASRWorkerML:
                 # "diarization unavailable" (diarization_available:false) honestly.
                 print(f"Warning: moving diarization to GPU failed ({e}) — disabling diarization")
                 self.diarize_model = None
+        if getattr(self, "punct", None) is not None:
+            try:
+                model, tok = self.punct
+                self.punct = (model.to(self.device).half(), tok)
+            except Exception as e:
+                # Пунктуация не критична: оставляем на процессоре, а не теряем вовсе.
+                # На процессоре час речи это 27с против 1,4с на карте (замерено), что
+                # для одного файла терпимо.
+                print(f"Warning: moving punctuation to GPU failed ({e}) — stays on CPU")
         print(f"Models moved to {self.device}. Worker ready.")
 
     @modal.method()
@@ -388,6 +487,32 @@ class ASRWorkerML:
             print(f"Duration: {duration:.1f}s")
 
             segments = self._run_gigaam(audio_path, enable_diarization, min_speakers, max_speakers)
+
+            # Знаки — ПО СЕГМЕНТАМ, а не по склеенному тексту: сегмент это реплика от
+            # VAD со своими временами и меткой говорящего, так они гарантированно не
+            # поедут. Отказ пунктуации не роняет расшифровку — текст отдаётся как есть.
+            punct = getattr(self, "punct", None)
+            if punct and segments:
+                import time as _t
+                t0 = _t.perf_counter()
+                n_changed = 0
+                for seg in segments:
+                    raw = seg.get("text") or ""
+                    if not raw:
+                        continue
+                    try:
+                        marked = _punctuate(punct, raw)
+                    except Exception as e:
+                        print(f"Warning: punctuation failed ({type(e).__name__}: {e}) — "
+                              f"returning the rest of the text without marks")
+                        break
+                    if marked != raw:
+                        seg["text"] = marked
+                        n_changed += 1
+                print(f"Punctuation: {n_changed}/{len(segments)} segments in "
+                      f"{_t.perf_counter() - t0:.2f}s")
+            elif not punct:
+                print("Punctuation model unavailable — returning text without marks")
 
             full_text = " ".join(s["text"] for s in segments if s.get("text"))
             formatted_text = self._build_formatted_text(segments) if enable_diarization else full_text
