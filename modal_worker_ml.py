@@ -85,30 +85,26 @@ PUNCT_CHUNK, PUNCT_OVERLAP = 400, 50
 
 
 def _load_punct(device):
-    """Модель расстановки знаков. Грузится ВМЕСТЕ с остальными, в on_start: тогда к
-    моменту, когда расшифровка готова, модель уже в памяти, и запрос платит только за
-    сам проход (1,4с на час речи на A10). Загрузка стоит 7-8с и при загрузке по
-    требованию ложилась бы на первый файл после каждого холодного старта.
+    """Модель расстановки знаков. Грузится ВМЕСТЕ с остальными, в фазе снимка
+    (@modal.enter(snap=True)), поэтому её 7-8с попадают в снимок памяти и на запросы не
+    влияют вовсе — к концу расшифровки модель уже готова. Сам проход по тексту — 1,4с
+    на час речи на A10.
 
-    Возвращает (модель, токенизатор) или None — отказ пунктуации не должен мешать
-    расшифровке."""
-    try:
-        import torch
-        from transformers import AutoModelForTokenClassification, AutoTokenizer
+    Возвращает (модель, токенизатор). Исключения НЕ глотает — их гасит вызывающий,
+    чтобы обёртка offline-first могла сделать повторную попытку."""
+    import torch
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(PUNCT_REPO)
-        # reference_compile=False обязателен: иначе transformers зовёт torch.compile, а в
-        # образе нет компилятора C — падает с «Failed to find C compiler» (проверено).
-        model = AutoModelForTokenClassification.from_pretrained(
-            PUNCT_REPO,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-            reference_compile=False,
-        ).eval().to(device)
-        print(f"Punctuation model loaded ({PUNCT_REPO}, {device})")
-        return model, tok
-    except Exception as e:  # noqa: BLE001
-        print(f"Warning: punctuation model failed to load: {type(e).__name__}: {e}")
-        return None
+    tok = AutoTokenizer.from_pretrained(PUNCT_REPO)
+    # reference_compile=False обязателен: иначе transformers зовёт torch.compile, а в
+    # образе нет компилятора C — падает с «Failed to find C compiler» (проверено).
+    model = AutoModelForTokenClassification.from_pretrained(
+        PUNCT_REPO,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        reference_compile=False,
+    ).eval().to(device)
+    print(f"Punctuation model loaded ({PUNCT_REPO}, {device})")
+    return model, tok
 
 
 def _punctuate(punct, text: str) -> str:
@@ -242,8 +238,13 @@ image = (
     # os.environ[...] в load_models происходит ПОСЛЕ импортов, то есть для них уже поздно —
     # поэтому веса pyannote до сих пор качались заново на каждом холодном старте
     # (авария 16.07.2026, когда HuggingFace был недоступен).
-    # Слой последний → pip_install берётся из кеша, незапиненный GigaAM не перекачивается
-    # (проверено прогоном: собрался только слой ENV).
+    # ВНИМАНИЕ: это было верно, пока менялся только слой .env(). Сейчас в pip_install
+    # добавлен transformers, значит ЭТОТ слой пересоберётся, и вместе с ним заново
+    # разрешатся все незапиненные строки списка — включая git+GigaAM.git на HEAD.
+    # На HEAD у GigaAM сейчас onnx==1.19.*, onnxruntime==1.23.*, numpy==2.*, а набор
+    # longform целит в pyannote 4 / torch 2.10 / transformers 5 (проверено по pyproject).
+    # Мы ставим пакет без наборов, но пины ядра приедут. Перед деплоем это стоит
+    # учитывать: на Beam такая же пересборка прошла зелёной, на Modal она ещё не делалась.
     # HF_XET_CACHE здесь ОБЯЗАТЕЛЕН: как только HF_HOME указывает в том, путь кеша xet по
     # умолчанию становится $HF_HOME/xet — ровно тот каталог, из-за которого 12.10 ломалось
     # восстановление снимка. Без этой строки защита держится на одном setdefault и порядке
@@ -422,7 +423,18 @@ class ASRWorkerML:
         # вместе с остальными моделями. Так загрузка (7-8с) попадает в снимок памяти и
         # на запросы не влияет: к концу расшифровки модель уже готова.
         print("Loading punctuation model (CPU, snapshot phase)...")
-        self.punct = _load_punct("cpu")
+        # Через _load_offline_first, как GigaAM и pyannote: сам _hf_offline сейчас не
+        # действует (переменные ставятся после импорта huggingface_hub), но если его
+        # когда-нибудь починят, прямая загрузка молча отключила бы пунктуацию на
+        # холодном кеше — а здесь будет честная попытка в сети.
+        try:
+            self.punct = _load_offline_first(lambda: _load_punct("cpu"), "punctuation model")
+        except Exception as e:
+            # Гасим ЗДЕСЬ, а не внутри _load_punct: иначе обёртка offline-first
+            # бессмысленна — повторная попытка не сработает, если загрузчик сам съедает
+            # исключение.
+            print(f"Warning: punctuation model failed to load: {type(e).__name__}: {e}")
+            self.punct = None
 
         print("Snapshot-phase load complete (models on CPU).")
 
@@ -454,10 +466,12 @@ class ASRWorkerML:
                 model, tok = self.punct
                 self.punct = (model.to(self.device).half(), tok)
             except Exception as e:
-                # Пунктуация не критична: оставляем на процессоре, а не теряем вовсе.
-                # На процессоре час речи это 27с против 1,4с на карте (замерено), что
-                # для одного файла терпимо.
-                print(f"Warning: moving punctuation to GPU failed ({e}) — stays on CPU")
+                # Отключаем, а НЕ «оставляем на процессоре»: .to() и .half() меняют модуль
+                # на месте, поэтому после сбоя на середине он остаётся полуперенесённым,
+                # и _punctuate берёт устройство у первого параметра — каждый сегмент падал
+                # бы на несовпадении устройств. Так же устроена ветка диаризации выше.
+                print(f"Warning: moving punctuation to GPU failed ({e}) — punctuation disabled")
+                self.punct = None
         print(f"Models moved to {self.device}. Worker ready.")
 
     @modal.method()
