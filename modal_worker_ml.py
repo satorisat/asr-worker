@@ -155,7 +155,13 @@ def _punctuate(punct, text: str) -> str:
     for e in sorted(marks):
         if not (e == len(text) or text[e] == " "):
             continue
-        res.append(text[prev:e] + marks[e])
+        mark = marks[e]
+        # Тире — с пробелом перед ним, как в эталонном punctuate.py автора модели
+        # (там для этой метки возвращается " -"). Без пробела получалось «келдім- ол»,
+        # а на конце сегмента «келдім-», что в субтитрах читается как обрезанное слово.
+        if mark == "-":
+            mark = " -"
+        res.append(text[prev:e] + mark)
         prev = e
     return "".join(res) + text[prev:]
 
